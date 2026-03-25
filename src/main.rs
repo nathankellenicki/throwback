@@ -4,7 +4,6 @@ mod device;
 use cartridge::{CartridgeInfo, CartridgeType, detect_gba_save, format_size, trim_gba_rom};
 use clap::{Parser, Subcommand};
 use device::{ChipType, Device};
-use rusb::UsbContext;
 use std::fs;
 use std::path::PathBuf;
 use std::process;
@@ -26,8 +25,6 @@ enum Commands {
         #[arg(long)]
         raw: bool,
     },
-    /// Show USB device details
-    UsbDebug,
     /// Dump ROM to a file
     DumpRom {
         /// Output file path
@@ -55,7 +52,7 @@ fn open_device() -> Device {
     }
 }
 
-fn read_cart_info(device: &Device) -> CartridgeInfo {
+fn read_cart_info(device: &mut Device) -> CartridgeInfo {
     match device.read_cartridge_info() {
         Ok(data) => {
             let info = CartridgeInfo::from_bytes(&data);
@@ -84,7 +81,7 @@ fn print_progress(label: &str, current: u32, total: u32) {
     }
 }
 
-fn dump_rom_gb(device: &Device, info: &CartridgeInfo, output: &PathBuf) {
+fn dump_rom_gb(device: &mut Device, info: &CartridgeInfo, output: &PathBuf) {
     eprintln!("Dumping GB ROM ({})...", format_size(info.rom_size));
 
     match device.read_rom(ChipType::Unknown, info.rom_size, info.ram_size, |cur| {
@@ -104,7 +101,7 @@ fn dump_rom_gb(device: &Device, info: &CartridgeInfo, output: &PathBuf) {
     }
 }
 
-fn dump_rom_gba(device: &Device, _info: &CartridgeInfo, output: &PathBuf) {
+fn dump_rom_gba(device: &mut Device, _info: &CartridgeInfo, output: &PathBuf) {
     eprintln!(
         "Dumping GBA ROM (reading {} max, will auto-trim)...",
         format_size(GBA_MAX_ROM)
@@ -117,7 +114,10 @@ fn dump_rom_gba(device: &Device, _info: &CartridgeInfo, output: &PathBuf) {
             let trimmed_size = trim_gba_rom(&rom);
             let trimmed = &rom[..trimmed_size];
 
-            eprintln!("Trimmed to {} (actual ROM data)", format_size(trimmed_size as u32));
+            eprintln!(
+                "Trimmed to {} (actual ROM data)",
+                format_size(trimmed_size as u32)
+            );
 
             fs::write(output, trimmed).unwrap_or_else(|e| {
                 eprintln!("Error writing file: {e}");
@@ -136,49 +136,8 @@ fn main() {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::UsbDebug => {
-            let ctx = rusb::Context::new().unwrap();
-            for device in ctx.devices().unwrap().iter() {
-                let desc = device.device_descriptor().unwrap();
-                if desc.vendor_id() == 0x16D0 || desc.vendor_id() == 0x1D50 {
-                    println!(
-                        "Found: VID={:04X} PID={:04X}",
-                        desc.vendor_id(),
-                        desc.product_id()
-                    );
-                    let config = device.active_config_descriptor().unwrap();
-                    println!(
-                        "Config {}: {} interfaces",
-                        config.number(),
-                        config.num_interfaces()
-                    );
-                    for iface in config.interfaces() {
-                        for alt in iface.descriptors() {
-                            println!(
-                                "  Interface {}: class={} subclass={} protocol={}, {} endpoints",
-                                alt.interface_number(),
-                                alt.class_code(),
-                                alt.sub_class_code(),
-                                alt.protocol_code(),
-                                alt.num_endpoints()
-                            );
-                            for ep in alt.endpoint_descriptors() {
-                                println!(
-                                    "    EP 0x{:02X}: dir={:?} type={:?} max_packet={}",
-                                    ep.address(),
-                                    ep.direction(),
-                                    ep.transfer_type(),
-                                    ep.max_packet_size()
-                                );
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
         Commands::Info { raw } => {
-            let device = open_device();
+            let mut device = open_device();
             let data = match device.read_cartridge_info() {
                 Ok(d) => d,
                 Err(e) => {
@@ -215,18 +174,18 @@ fn main() {
         }
 
         Commands::DumpRom { output } => {
-            let device = open_device();
-            let info = read_cart_info(&device);
+            let mut device = open_device();
+            let info = read_cart_info(&mut device);
 
             match info.cart_type {
-                CartridgeType::GB => dump_rom_gb(&device, &info, &output),
-                CartridgeType::GBA => dump_rom_gba(&device, &info, &output),
+                CartridgeType::GB => dump_rom_gb(&mut device, &info, &output),
+                CartridgeType::GBA => dump_rom_gba(&mut device, &info, &output),
             }
         }
 
         Commands::ReadSave { output } => {
-            let device = open_device();
-            let info = read_cart_info(&device);
+            let mut device = open_device();
+            let info = read_cart_info(&mut device);
 
             match info.cart_type {
                 CartridgeType::GB => {
@@ -237,9 +196,12 @@ fn main() {
 
                     eprintln!("Reading save ({})...", format_size(info.ram_size));
 
-                    match device.read_save(ChipType::Unknown, info.rom_size, info.ram_size, |cur| {
-                        print_progress("Reading", cur, info.ram_size);
-                    }) {
+                    match device.read_save(
+                        ChipType::Unknown,
+                        info.rom_size,
+                        info.ram_size,
+                        |cur| print_progress("Reading", cur, info.ram_size),
+                    ) {
                         Ok(save) => {
                             fs::write(&output, &save).unwrap_or_else(|e| {
                                 eprintln!("Error writing file: {e}");
@@ -254,7 +216,6 @@ fn main() {
                     }
                 }
                 CartridgeType::GBA => {
-                    // For GBA, we need to dump the ROM first to detect save type
                     eprintln!("Dumping ROM to detect save type...");
 
                     let rom = match device.read_rom(ChipType::Unknown, GBA_MAX_ROM, 0, |cur| {
@@ -275,7 +236,7 @@ fn main() {
                     }
 
                     let rom_size = trim_gba_rom(&rom) as u32;
-                    eprintln!("Detected save: {:?}, {} ", chip, format_size(save_size));
+                    eprintln!("Detected save: {:?}, {}", chip, format_size(save_size));
                     eprintln!("Reading save...");
 
                     match device.read_save(chip, rom_size, save_size, |cur| {
@@ -298,8 +259,8 @@ fn main() {
         }
 
         Commands::WriteSave { input } => {
-            let device = open_device();
-            let info = read_cart_info(&device);
+            let mut device = open_device();
+            let info = read_cart_info(&mut device);
 
             let data = fs::read(&input).unwrap_or_else(|e| {
                 eprintln!("Error reading file: {e}");
@@ -334,7 +295,6 @@ fn main() {
                     }
                 }
                 CartridgeType::GBA => {
-                    // Dump ROM to detect save type
                     eprintln!("Dumping ROM to detect save type...");
 
                     let rom = match device.read_rom(ChipType::Unknown, GBA_MAX_ROM, 0, |cur| {
@@ -364,11 +324,7 @@ fn main() {
                         );
                     }
 
-                    eprintln!(
-                        "Detected save: {:?}, {}",
-                        chip,
-                        format_size(save_size)
-                    );
+                    eprintln!("Detected save: {:?}, {}", chip, format_size(save_size));
                     eprintln!("Writing save ({})...", format_size(data.len() as u32));
 
                     match device.write_save(chip, rom_size, &data, |cur| {

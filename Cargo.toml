@@ -5,6 +5,6 @@ edition = "2024"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
-rusb = "0.9"
+serialport = "4"
 crc = "3"
 thiserror = "2"
