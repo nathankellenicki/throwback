@@ -201,17 +201,59 @@ fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack.windows(needle.len()).position(|w| w == needle)
 }
 
-/// Trim trailing 0xFF padding from a GBA ROM dump to find the real ROM size.
+/// Detect the real ROM size of a GBA dump.
+/// GBA ROMs are always power-of-two sized (1/2/4/8/16/32 MB).
+/// Past the real ROM, the GBA bus returns open-bus values (incrementing u16)
+/// or 0xFF padding. We check each power-of-two boundary to find where
+/// real ROM data ends.
 pub fn trim_gba_rom(rom: &[u8]) -> usize {
-    let last_data = rom.iter().rposition(|&b| b != 0xFF).unwrap_or(0);
-    let real_len = last_data + 1;
+    let sizes: &[usize] = &[
+        1 * 1024 * 1024,
+        2 * 1024 * 1024,
+        4 * 1024 * 1024,
+        8 * 1024 * 1024,
+        16 * 1024 * 1024,
+        32 * 1024 * 1024,
+    ];
 
-    let min_size = 1024 * 1024;
-    let mut size = min_size;
-    while size < real_len {
-        size *= 2;
+    for &size in sizes {
+        if size > rom.len() {
+            continue;
+        }
+        // Check if data just past this boundary looks like open bus or padding.
+        // Open bus: incrementing 16-bit values matching the address / 2.
+        // Padding: all 0xFF.
+        if size < rom.len() {
+            let check_offset = size;
+            let check_len = 32.min(rom.len() - check_offset);
+            let region = &rom[check_offset..check_offset + check_len];
+
+            let all_ff = region.iter().all(|&b| b == 0xFF);
+            let all_zero = region.iter().all(|&b| b == 0x00);
+
+            // Open bus: sequential incrementing u16 values starting from 0
+            let mut is_open_bus = check_len >= 4;
+            for j in (0..check_len).step_by(2) {
+                if j + 1 >= check_len { break; }
+                let expected = (j / 2) as u16;
+                let actual = u16::from_le_bytes([region[j], region[j + 1]]);
+                if actual != expected {
+                    is_open_bus = false;
+                    break;
+                }
+            }
+
+            if all_ff || all_zero || is_open_bus {
+                return size;
+            }
+        }
+
+        if size == rom.len() {
+            return size;
+        }
     }
-    size.min(rom.len())
+
+    rom.len()
 }
 
 pub fn format_size(bytes: u32) -> String {
