@@ -183,6 +183,9 @@ impl fmt::Display for CartridgeInfo {
 /// Detect the save type and size of a GBA ROM by scanning for save library strings.
 pub fn detect_gba_save(rom: &[u8]) -> (ChipType, u32) {
     if find_bytes(rom, b"EEPROM_V").is_some() {
+        // EEPROM is either 512 bytes (4Kbit) or 8 KB (64Kbit).
+        // Always read 8KB — detect_eeprom_size() will determine the real size
+        // by checking for mirroring after the data is read.
         (ChipType::Eeprom, 8 * 1024)
     } else if find_bytes(rom, b"FLASH1M_V").is_some() {
         (ChipType::Flash, 128 * 1024)
@@ -194,6 +197,30 @@ pub fn detect_gba_save(rom: &[u8]) -> (ChipType, u32) {
         (ChipType::Sram, 32 * 1024)
     } else {
         (ChipType::Unknown, 0)
+    }
+}
+
+/// Detect actual EEPROM size from an 8KB read.
+/// 512-byte EEPROM mirrors every 512 bytes when read as 8KB.
+/// Returns the trimmed save data (512 bytes or 8KB).
+pub fn detect_eeprom_size(data: &[u8]) -> Vec<u8> {
+    if data.len() < 8 * 1024 {
+        return data.to_vec();
+    }
+
+    let first_block = &data[..512];
+
+    // Check if every 512-byte block is identical to the first
+    let is_mirrored = (1..16).all(|i| {
+        let block = &data[i * 512..(i + 1) * 512];
+        block == first_block
+    });
+
+    if is_mirrored {
+        // 512-byte EEPROM — data repeats every 512 bytes
+        data[..512].to_vec()
+    } else {
+        data.to_vec()
     }
 }
 

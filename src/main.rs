@@ -1,7 +1,7 @@
 mod cartridge;
 mod device;
 
-use cartridge::{CartridgeInfo, CartridgeType, detect_gba_save, format_size, trim_gba_rom};
+use cartridge::{CartridgeInfo, CartridgeType, detect_eeprom_size, detect_gba_save, format_size, trim_gba_rom};
 use clap::{Parser, Subcommand};
 use device::{ChipType, Device};
 use std::fs;
@@ -248,6 +248,20 @@ fn main() {
                         print_progress("Reading", cur, save_size);
                     }) {
                         Ok(save) => {
+                            // For EEPROM: detect actual size by checking for mirroring
+                            let save = if chip == ChipType::Eeprom {
+                                let trimmed = detect_eeprom_size(&save);
+                                if trimmed.len() < save.len() {
+                                    eprintln!(
+                                        "EEPROM mirror detected: actual size is {}",
+                                        format_size(trimmed.len() as u32)
+                                    );
+                                }
+                                trimmed
+                            } else {
+                                save
+                            };
+
                             fs::write(&output, &save).unwrap_or_else(|e| {
                                 eprintln!("Error writing file: {e}");
                                 process::exit(1);
