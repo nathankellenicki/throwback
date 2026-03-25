@@ -41,6 +41,17 @@ pub struct Device {
     port: Box<dyn serialport::SerialPort>,
 }
 
+/// Check if a chunk looks like GBA open bus (sequential u16 from 0).
+fn is_open_bus(data: &[u8]) -> bool {
+    if data.len() < 4 { return false; }
+    for j in (0..data.len() - 1).step_by(2) {
+        let expected = (j / 2) as u16;
+        let actual = u16::from_le_bytes([data[j], data[j + 1]]);
+        if actual != expected { return false; }
+    }
+    true
+}
+
 impl Device {
     pub fn open() -> Result<Self, DeviceError> {
         let ports = serialport::available_ports()?;
@@ -180,10 +191,10 @@ impl Device {
         let mut drain = [0u8; 512];
         self.port.read_exact(&mut drain)?;
 
-        // Match Playback's exact flow:
         // Loop (romSize / 256) times:
         //   if i % 64 == 0: write 64-byte zero ACK, THEN read 256 bytes
         //   else: read 256 bytes
+        // At each power-of-two boundary, check for open bus / end of ROM.
         let total_packets = rom_size as usize / 256;
         let mut rom = Vec::with_capacity(rom_size as usize);
 
@@ -193,6 +204,14 @@ impl Device {
             }
             let mut buf = [0u8; 256];
             self.port.read_exact(&mut buf)?;
+
+            // At power-of-two boundaries (>=1MB), check for open bus = end of ROM
+            let len = rom.len();
+            if len >= 1024 * 1024 && len.is_power_of_two() && is_open_bus(&buf) {
+                rom.truncate(len);
+                return Ok(rom);
+            }
+
             rom.extend_from_slice(&buf);
             progress(rom.len() as u32);
         }

@@ -228,10 +228,10 @@ pub fn trim_gba_rom(rom: &[u8]) -> usize {
             let check_len = 32.min(rom.len() - check_offset);
             let region = &rom[check_offset..check_offset + check_len];
 
-            let all_ff = region.iter().all(|&b| b == 0xFF);
-            let all_zero = region.iter().all(|&b| b == 0x00);
-
-            // Open bus: sequential incrementing u16 values starting from 0
+            // Only check for open bus pattern (00 00 01 00 02 00 03 00...).
+            // 0xFF padding is NOT a reliable indicator — some ROMs have 0xFF
+            // gaps between data sections (e.g. Pokemon Ruby has data at 14.7MB
+            // but 0xFF at 8MB).
             let mut is_open_bus = check_len >= 4;
             for j in (0..check_len).step_by(2) {
                 if j + 1 >= check_len { break; }
@@ -243,7 +243,7 @@ pub fn trim_gba_rom(rom: &[u8]) -> usize {
                 }
             }
 
-            if all_ff || all_zero || is_open_bus {
+            if is_open_bus {
                 return size;
             }
         }
