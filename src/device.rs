@@ -42,7 +42,7 @@ pub struct Device {
 }
 
 /// Check if a chunk looks like GBA open bus (sequential u16 from 0).
-fn is_open_bus(data: &[u8]) -> bool {
+pub fn is_open_bus(data: &[u8]) -> bool {
     if data.len() < 4 { return false; }
     for j in (0..data.len() - 1).step_by(2) {
         let expected = (j / 2) as u16;
@@ -50,6 +50,18 @@ fn is_open_bus(data: &[u8]) -> bool {
         if actual != expected { return false; }
     }
     true
+}
+
+pub fn build_command(command: u8, chip: ChipType, rom_size: u32, save_size: u32) -> [u8; PACKET_SIZE] {
+    let mut packet = [0u8; PACKET_SIZE];
+    packet[0] = command;
+    packet[1] = chip as u8;
+    packet[2..6].copy_from_slice(&rom_size.to_le_bytes());
+    packet[6..10].copy_from_slice(&save_size.to_le_bytes());
+
+    let checksum = CRC.checksum(&packet[..60]);
+    packet[60..64].copy_from_slice(&checksum.to_le_bytes());
+    packet
 }
 
 impl Device {
@@ -76,17 +88,6 @@ impl Device {
         Ok(Self { port })
     }
 
-    fn build_command(command: u8, chip: ChipType, rom_size: u32, save_size: u32) -> [u8; PACKET_SIZE] {
-        let mut packet = [0u8; PACKET_SIZE];
-        packet[0] = command;
-        packet[1] = chip as u8;
-        packet[2..6].copy_from_slice(&rom_size.to_le_bytes());
-        packet[6..10].copy_from_slice(&save_size.to_le_bytes());
-
-        let checksum = CRC.checksum(&packet[..60]);
-        packet[60..64].copy_from_slice(&checksum.to_le_bytes());
-        packet
-    }
 
     fn send(&mut self, packet: &[u8; PACKET_SIZE]) -> Result<(), DeviceError> {
         self.port.write_all(packet)?;
@@ -119,7 +120,7 @@ impl Device {
     }
 
     pub fn read_cartridge_info(&mut self) -> Result<[u8; 64], DeviceError> {
-        let packet = Self::build_command(CMD_READ_SIGNATURE, ChipType::Unknown, 0, 0);
+        let packet = build_command(CMD_READ_SIGNATURE, ChipType::Unknown, 0, 0);
         self.send(&packet)?;
 
         let buf = self.read_until_timeout();
@@ -146,7 +147,7 @@ impl Device {
         save_size: u32,
         progress: impl Fn(u32),
     ) -> Result<Vec<u8>, DeviceError> {
-        let packet = Self::build_command(CMD_READ_GAME, chip, rom_size, save_size);
+        let packet = build_command(CMD_READ_GAME, chip, rom_size, save_size);
         self.send(&packet)?;
         self.drain(512)?;
 
@@ -179,7 +180,7 @@ impl Device {
         save_size: u32,
         progress: impl Fn(u32),
     ) -> Result<Vec<u8>, DeviceError> {
-        let packet = Self::build_command(CMD_READ_SAVE, chip, rom_size, save_size);
+        let packet = build_command(CMD_READ_SAVE, chip, rom_size, save_size);
         self.send(&packet)?;
         self.drain(512)?;
 
@@ -208,7 +209,7 @@ impl Device {
         // Flush stale data
         self.read_until_timeout();
 
-        let packet = Self::build_command(CMD_WRITE_SAVE, chip, rom_size, save_size);
+        let packet = build_command(CMD_WRITE_SAVE, chip, rom_size, save_size);
         self.send(&packet)?;
         self.drain(512)?;
 
@@ -242,14 +243,14 @@ impl Device {
 
         // Step 1: DetectFlashcart — required before WriteGame to prevent USB reset
         erase_progress("Preparing cartridge...");
-        let detect_packet = Self::build_command(CMD_DETECT_FLASHCART, ChipType::Unknown, 0, 0);
+        let detect_packet = build_command(CMD_DETECT_FLASHCART, ChipType::Unknown, 0, 0);
         self.send(&detect_packet)?;
         self.port.set_timeout(Duration::from_secs(30))?;
         let _ = self.read_until_timeout();
 
         // Step 2: WriteGame command
         erase_progress("Erasing flash...");
-        let packet = Self::build_command(CMD_WRITE_GAME, ChipType::Unknown, rom_size, 0);
+        let packet = build_command(CMD_WRITE_GAME, ChipType::Unknown, rom_size, 0);
         self.send(&packet)?;
 
         // Wait for erase — read EE progress packets
