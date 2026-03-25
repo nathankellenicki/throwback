@@ -40,6 +40,11 @@ enum Commands {
         /// Input file path
         input: PathBuf,
     },
+    /// Write ROM to a flash cart
+    WriteRom {
+        /// Input file path
+        input: PathBuf,
+    },
 }
 
 fn open_device() -> Device {
@@ -336,6 +341,37 @@ fn main() {
                             process::exit(1);
                         }
                     }
+                }
+            }
+        }
+
+        Commands::WriteRom { input } => {
+            let mut device = open_device();
+
+            let data = fs::read(&input).unwrap_or_else(|e| {
+                eprintln!("Error reading file: {e}");
+                process::exit(1);
+            });
+
+            // Pad to 64-byte boundary
+            let mut padded = data.clone();
+            if padded.len() % 64 != 0 {
+                padded.resize(padded.len() + (64 - padded.len() % 64), 0xFF);
+            }
+
+            eprintln!("Writing {} to flash cart...", format_size(padded.len() as u32));
+
+            match device.write_rom(&padded, |cur| {
+                print_progress("Writing", cur, padded.len() as u32);
+            }, |msg| {
+                eprintln!("\r{}    ", msg);
+            }) {
+                Ok(()) => {
+                    eprintln!("ROM written successfully.");
+                }
+                Err(e) => {
+                    eprintln!("\nError: {e}");
+                    process::exit(1);
                 }
             }
         }

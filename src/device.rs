@@ -10,11 +10,11 @@ const CRC: Crc<u32> = Crc::<u32>::new(&CRC_32_MPEG_2);
 
 // Command bytes
 const CMD_READ_GAME: u8 = 0x00;
-#[allow(dead_code)]
 const CMD_WRITE_GAME: u8 = 0x01;
 const CMD_READ_SAVE: u8 = 0x02;
 const CMD_WRITE_SAVE: u8 = 0x03;
 const CMD_READ_SIGNATURE: u8 = 0x04;
+const CMD_DETECT_FLASHCART: u8 = 0x15;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -27,7 +27,7 @@ pub enum ChipType {
 
 #[derive(Debug, Error)]
 pub enum DeviceError {
-    #[error("GB Operator not found — no serial port detected")]
+    #[error("GB Operator not found")]
     NotFound,
     #[error("Serial port error: {0}")]
     Serial(#[from] serialport::Error),
@@ -98,6 +98,12 @@ impl Device {
         self.send(&zeros)
     }
 
+    fn drain(&mut self, n: usize) -> Result<(), DeviceError> {
+        let mut buf = vec![0u8; n];
+        self.port.read_exact(&mut buf)?;
+        Ok(())
+    }
+
     /// Read until timeout, return all bytes received.
     fn read_until_timeout(&mut self) -> Vec<u8> {
         let mut buf = Vec::new();
@@ -112,56 +118,12 @@ impl Device {
         buf
     }
 
-    /// Read exactly `len` bytes from the stream, skipping C0DE framing packets
-    /// and protocol padding (zero/AA-filled 64-byte blocks).
-    fn read_data_stream(&mut self, len: usize, progress: impl Fn(u32)) -> Result<Vec<u8>, DeviceError> {
-        let mut data = Vec::with_capacity(len);
-        let mut pending = Vec::new();
-
-        while data.len() < len {
-            // Read more from port
-            let mut tmp = [0u8; 4096];
-            match self.port.read(&mut tmp) {
-                Ok(n) if n > 0 => pending.extend_from_slice(&tmp[..n]),
-                Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
-                    if data.is_empty() {
-                        continue; // Keep waiting if we haven't gotten any data yet
-                    }
-                    return Err(DeviceError::NoResponse);
-                }
-                Err(e) => return Err(e.into()),
-                _ => continue,
-            }
-
-            // Process complete 64-byte packets from pending buffer
-            while pending.len() >= PACKET_SIZE && data.len() < len {
-                let chunk = &pending[..PACKET_SIZE];
-
-                // Skip C0DE framing
-                if chunk[0] == 0xC0 && chunk[1] == 0xDE {
-                    pending.drain(..PACKET_SIZE);
-                    continue;
-                }
-
-                let remaining = len - data.len();
-                let copy_len = PACKET_SIZE.min(remaining);
-                data.extend_from_slice(&chunk[..copy_len]);
-                pending.drain(..PACKET_SIZE);
-
-                progress(data.len() as u32);
-            }
-        }
-
-        Ok(data)
-    }
-
     pub fn read_cartridge_info(&mut self) -> Result<[u8; 64], DeviceError> {
         let packet = Self::build_command(CMD_READ_SIGNATURE, ChipType::Unknown, 0, 0);
         self.send(&packet)?;
 
         let buf = self.read_until_timeout();
 
-        // Scan on 64-byte boundaries for the signature data
         let mut data = [0u8; 64];
         let mut i = 0;
         while i + 64 <= buf.len() {
@@ -186,15 +148,8 @@ impl Device {
     ) -> Result<Vec<u8>, DeviceError> {
         let packet = Self::build_command(CMD_READ_GAME, chip, rom_size, save_size);
         self.send(&packet)?;
+        self.drain(512)?;
 
-        // Drain C0DE ready + padding (512 bytes) that arrives before ROM data
-        let mut drain = [0u8; 512];
-        self.port.read_exact(&mut drain)?;
-
-        // Loop (romSize / 256) times:
-        //   if i % 64 == 0: write 64-byte zero ACK, THEN read 256 bytes
-        //   else: read 256 bytes
-        // At each power-of-two boundary, check for open bus / end of ROM.
         let total_packets = rom_size as usize / 256;
         let mut rom = Vec::with_capacity(rom_size as usize);
 
@@ -205,10 +160,8 @@ impl Device {
             let mut buf = [0u8; 256];
             self.port.read_exact(&mut buf)?;
 
-            // At power-of-two boundaries (>=1MB), check for open bus = end of ROM
             let len = rom.len();
             if len >= 1024 * 1024 && len.is_power_of_two() && is_open_bus(&buf) {
-                rom.truncate(len);
                 return Ok(rom);
             }
 
@@ -228,12 +181,8 @@ impl Device {
     ) -> Result<Vec<u8>, DeviceError> {
         let packet = Self::build_command(CMD_READ_SAVE, chip, rom_size, save_size);
         self.send(&packet)?;
+        self.drain(512)?;
 
-        // Drain C0DE ready + padding (512 bytes)
-        let mut drain = [0u8; 512];
-        self.port.read_exact(&mut drain)?;
-
-        // Read save data in 256-byte chunks, matching Playback
         let total_packets = save_size as usize / 256;
         let mut save = Vec::with_capacity(save_size as usize);
 
@@ -255,14 +204,14 @@ impl Device {
         progress: impl Fn(u32),
     ) -> Result<(), DeviceError> {
         let save_size = data.len() as u32;
+
+        // Flush stale data
+        self.read_until_timeout();
+
         let packet = Self::build_command(CMD_WRITE_SAVE, chip, rom_size, save_size);
         self.send(&packet)?;
+        self.drain(512)?;
 
-        // Drain C0DE ready + padding (512 bytes) before writing
-        let mut drain = [0u8; 512];
-        self.port.read_exact(&mut drain)?;
-
-        // Write 64-byte chunks. First chunk gets 20s timeout (device setup).
         self.port.set_timeout(Duration::from_secs(20))?;
 
         for (i, chunk) in data.chunks(PACKET_SIZE).enumerate() {
@@ -274,6 +223,76 @@ impl Device {
                 self.port.set_timeout(TIMEOUT)?;
             }
 
+            progress(((i + 1) * PACKET_SIZE).min(data.len()) as u32);
+        }
+
+        Ok(())
+    }
+
+    pub fn write_rom(
+        &mut self,
+        data: &[u8],
+        progress: impl Fn(u32),
+        erase_progress: impl Fn(&str),
+    ) -> Result<(), DeviceError> {
+        let rom_size = data.len() as u32;
+
+        // Flush stale data
+        self.read_until_timeout();
+
+        // Step 1: DetectFlashcart — required before WriteGame to prevent USB reset
+        erase_progress("Preparing cartridge...");
+        let detect_packet = Self::build_command(CMD_DETECT_FLASHCART, ChipType::Unknown, 0, 0);
+        self.send(&detect_packet)?;
+        self.port.set_timeout(Duration::from_secs(30))?;
+        let _ = self.read_until_timeout();
+
+        // Step 2: WriteGame command
+        erase_progress("Erasing flash...");
+        let packet = Self::build_command(CMD_WRITE_GAME, ChipType::Unknown, rom_size, 0);
+        self.send(&packet)?;
+
+        // Wait for erase — read EE progress packets
+        self.port.set_timeout(Duration::from_secs(10))?;
+        let mut seen_erase = false;
+        loop {
+            let mut buf = [0u8; 64];
+            match self.port.read(&mut buf) {
+                Ok(n) if n > 0 => {
+                    if buf[0] == 0xEE {
+                        seen_erase = true;
+                        erase_progress("Erasing...");
+                        continue;
+                    }
+                    if buf[0] == 0xC0 && buf[1] == 0xDE {
+                        if buf[2] == 0x01 && seen_erase { break; }
+                        continue;
+                    }
+                    if buf.iter().all(|&b| b == 0) {
+                        if seen_erase { break; }
+                        continue;
+                    }
+                }
+                Ok(_) => {
+                    if seen_erase { break; }
+                    continue;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
+                    if seen_erase { break; }
+                    continue;
+                }
+                Err(_) => break,
+            }
+        }
+
+        // Step 3: Write data — straight 64-byte chunks, no ACKs
+        erase_progress("Writing...");
+        self.port.set_timeout(TIMEOUT)?;
+
+        for (i, chunk) in data.chunks(PACKET_SIZE).enumerate() {
+            let mut buf = [0u8; PACKET_SIZE];
+            buf[..chunk.len()].copy_from_slice(chunk);
+            self.port.write_all(&buf)?;
             progress(((i + 1) * PACKET_SIZE).min(data.len()) as u32);
         }
 
