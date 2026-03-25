@@ -176,54 +176,27 @@ impl Device {
         let packet = Self::build_command(CMD_READ_GAME, chip, rom_size, save_size);
         self.send(&packet)?;
 
-        // Send command, then read everything into one big buffer.
-        // The stream contains: framing + ROM data + framing.
-        // We'll read rom_size + 2048 (generous framing overhead), then find the ROM.
-        let total_read = rom_size as usize + 2048;
-        let mut buf = vec![0u8; total_read];
+        // Drain C0DE ready + padding (512 bytes) that arrives before ROM data
+        let mut drain = [0u8; 512];
+        self.port.read_exact(&mut drain)?;
 
-        // Read the C0DE ready first
-        let mut ready = [0u8; 64];
-        self.port.read_exact(&mut ready)?;
+        // Match Playback's exact flow:
+        // Loop (romSize / 256) times:
+        //   if i % 64 == 0: write 64-byte zero ACK, THEN read 256 bytes
+        //   else: read 256 bytes
+        let total_packets = rom_size as usize / 256;
+        let mut rom = Vec::with_capacity(rom_size as usize);
 
-        // Send ACK
-        self.send_ack()?;
-
-        // Now read everything
-        let mut offset = 0;
-        let mut reported_done = false;
-        while offset < total_read {
-            let to_read = 4096.min(total_read - offset);
-            match self.port.read(&mut buf[offset..offset + to_read]) {
-                Ok(n) => offset += n,
-                Err(e) if e.kind() == std::io::ErrorKind::TimedOut => break,
-                Err(e) => return Err(e.into()),
+        for i in 0..total_packets {
+            if i % 64 == 0 {
+                self.send_ack()?;
             }
-            if !reported_done {
-                let data_progress = offset.saturating_sub(512).min(rom_size as usize);
-                progress(data_progress as u32);
-                if data_progress >= rom_size as usize {
-                    reported_done = true;
-                }
-            }
+            let mut buf = [0u8; 256];
+            self.port.read_exact(&mut buf)?;
+            rom.extend_from_slice(&buf);
+            progress(rom.len() as u32);
         }
 
-        // Find the ROM: scan for Nintendo logo (at ROM offset 0x104)
-        let logo: [u8; 4] = [0xCE, 0xED, 0x66, 0x66];
-        let logo_offset = 0x104;
-        let mut rom_start = None;
-        for i in 0..offset.saturating_sub(logo_offset + 4) {
-            if buf[i + logo_offset..i + logo_offset + 4] == logo {
-                rom_start = Some(i);
-                break;
-            }
-        }
-
-        let start = rom_start.unwrap_or(0);
-
-        let mut rom = vec![0u8; rom_size as usize];
-        let available = offset.saturating_sub(start).min(rom_size as usize);
-        rom[..available].copy_from_slice(&buf[start..start + available]);
         Ok(rom)
     }
 
@@ -237,32 +210,20 @@ impl Device {
         let packet = Self::build_command(CMD_READ_SAVE, chip, rom_size, save_size);
         self.send(&packet)?;
 
-        // Read framing + save data into one buffer, then extract save.
-        // Framing: C0DE ready(64) + 7 padding(448) = 512 bytes before data.
-        let total_read = save_size as usize + 1024;
-        let mut buf = vec![0u8; total_read];
-        let mut read_offset = 0;
-        let mut reported_done = false;
-        while read_offset < total_read {
-            match self.port.read(&mut buf[read_offset..]) {
-                Ok(n) => read_offset += n,
-                Err(e) if e.kind() == std::io::ErrorKind::TimedOut => break,
-                Err(e) => return Err(e.into()),
-            }
-            if !reported_done {
-                let data_read = read_offset.saturating_sub(512).min(save_size as usize);
-                progress(data_read as u32);
-                if data_read >= save_size as usize {
-                    reported_done = true;
-                }
-            }
-        }
+        // Drain C0DE ready + padding (512 bytes)
+        let mut drain = [0u8; 512];
+        self.port.read_exact(&mut drain)?;
 
-        // Skip the 512-byte framing header
-        let start = 512.min(read_offset);
-        let mut save = vec![0u8; save_size as usize];
-        let available = read_offset.saturating_sub(start).min(save_size as usize);
-        save[..available].copy_from_slice(&buf[start..start + available]);
+        // Read save data in 256-byte chunks, matching Playback
+        let total_packets = save_size as usize / 256;
+        let mut save = Vec::with_capacity(save_size as usize);
+
+        for _ in 0..total_packets {
+            let mut buf = [0u8; 256];
+            self.port.read_exact(&mut buf)?;
+            save.extend_from_slice(&buf);
+            progress(save.len() as u32);
+        }
 
         Ok(save)
     }
