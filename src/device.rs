@@ -258,22 +258,23 @@ impl Device {
         let packet = Self::build_command(CMD_WRITE_SAVE, chip, rom_size, save_size);
         self.send(&packet)?;
 
-        // Drain C0DE ready + 7 padding packets = 512 bytes
+        // Drain C0DE ready + padding (512 bytes) before writing
         let mut drain = [0u8; 512];
         self.port.read_exact(&mut drain)?;
 
-        // Write in 64-byte chunks with per-chunk ACK
+        // Write 64-byte chunks. First chunk gets 20s timeout (device setup).
+        self.port.set_timeout(Duration::from_secs(20))?;
+
         for (i, chunk) in data.chunks(PACKET_SIZE).enumerate() {
             let mut buf = [0u8; PACKET_SIZE];
             buf[..chunk.len()].copy_from_slice(chunk);
             self.port.write_all(&buf)?;
 
-            // Read ACK
-            let mut ack = [0u8; 64];
-            let _ = self.port.read(&mut ack);
+            if i == 0 {
+                self.port.set_timeout(TIMEOUT)?;
+            }
 
             progress(((i + 1) * PACKET_SIZE).min(data.len()) as u32);
-            std::thread::sleep(Duration::from_micros(100));
         }
 
         Ok(())
