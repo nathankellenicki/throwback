@@ -26,8 +26,6 @@ pub struct CartridgeInfo {
     // GB fields
     pub title_char: char,
     pub mbc_type: u8,
-    pub rom_size_code: u8,
-    pub ram_size_code: u8,
     pub header_checksum: u8,
     pub global_checksum: u16,
     // GBA fields
@@ -46,8 +44,6 @@ impl CartridgeInfo {
 
         let title_char = data[0x0D] as char;
         let mbc_type = data[0x0E];
-        let rom_size_code = data[0x0F];
-        let ram_size_code = data[0x10];
         let header_checksum = data[0x11];
         let global_checksum = u16::from_le_bytes([data[0x12], data[0x13]]);
 
@@ -55,6 +51,8 @@ impl CartridgeInfo {
         let region = data[0x11];
 
         // Compute sizes from header codes
+        let rom_size_code = data[0x0F];
+        let ram_size_code = data[0x10];
         let (rom_size, ram_size) = match cart_type {
             CartridgeType::GB => {
                 let rom = if rom_size_code <= 8 {
@@ -86,8 +84,6 @@ impl CartridgeInfo {
             ram_size,
             title_char,
             mbc_type,
-            rom_size_code,
-            ram_size_code,
             header_checksum,
             global_checksum,
             game_code,
