@@ -1,7 +1,7 @@
 //! End-to-end tests — require a GB Operator with Pokemon Yellow inserted.
 //! Run with: cargo test --test e2e_tests -- --ignored
 
-use operator::device::{ChipType, Device};
+use flashback::device::{ChipType, Device};
 use sha2::{Digest, Sha256};
 
 const POKEMON_YELLOW_ROM_SHA256: &str =
