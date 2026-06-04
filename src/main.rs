@@ -3,7 +3,7 @@ mod device;
 
 use cartridge::{CartridgeInfo, CartridgeType, detect_eeprom_size, detect_gba_save, format_size, trim_gba_rom};
 use clap::{Parser, Subcommand};
-use device::{ChipType, Device};
+use device::{CartridgeDevice, ChipType, DeviceKind};
 use std::fs;
 use std::path::PathBuf;
 use std::process;
@@ -11,7 +11,7 @@ use std::process;
 const GBA_MAX_ROM: u32 = 32 * 1024 * 1024; // 32 MB
 
 #[derive(Parser)]
-#[command(name = "flashback", about = "CLI for the Epilogue GB Operator")]
+#[command(name = "flashback", about = "CLI for the Epilogue GB/SN Operator")]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -47,8 +47,8 @@ enum Commands {
     },
 }
 
-fn open_device() -> Device {
-    match Device::open() {
+fn open_device() -> Box<dyn CartridgeDevice> {
+    match device::open() {
         Ok(d) => d,
         Err(e) => {
             eprintln!("Error: {e}");
@@ -57,7 +57,7 @@ fn open_device() -> Device {
     }
 }
 
-fn read_cart_info(device: &mut Device) -> CartridgeInfo {
+fn read_cart_info(device: &mut dyn CartridgeDevice) -> CartridgeInfo {
     match device.read_cartridge_info() {
         Ok(data) => {
             let info = CartridgeInfo::from_bytes(&data);
@@ -74,6 +74,17 @@ fn read_cart_info(device: &mut Device) -> CartridgeInfo {
     }
 }
 
+/// SNES ROM/save transfers over the streaming protocol still need verification against
+/// a real cartridge (flow control + size detection — see notes/PROTOCOL.md). Until then,
+/// bail out clearly rather than sending an untested transfer.
+fn snes_not_ready(op: &str) -> ! {
+    eprintln!("SNES {op} is not yet verified against hardware.");
+    eprintln!("The SN Operator signature/info path works, but ROM/save transfer flow");
+    eprintln!("control still needs confirmation with a cartridge inserted.");
+    eprintln!("Tracked in notes/PROTOCOL.md (\"Open Questions\").");
+    process::exit(1);
+}
+
 fn print_progress(label: &str, current: u32, total: u32) {
     let pct = (current as f64 / total as f64 * 100.0) as u32;
     eprint!(
@@ -86,10 +97,10 @@ fn print_progress(label: &str, current: u32, total: u32) {
     }
 }
 
-fn dump_rom_gb(device: &mut Device, info: &CartridgeInfo, output: &PathBuf) {
+fn dump_rom_gb(device: &mut dyn CartridgeDevice, info: &CartridgeInfo, output: &PathBuf) {
     eprintln!("Dumping GB ROM ({})...", format_size(info.rom_size));
 
-    match device.read_rom(ChipType::Unknown, info.rom_size, info.ram_size, |cur| {
+    match device.read_rom(ChipType::Unknown, info.rom_size, info.ram_size, &|cur| {
         print_progress("Reading", cur, info.rom_size);
     }) {
         Ok(rom) => {
@@ -106,13 +117,13 @@ fn dump_rom_gb(device: &mut Device, info: &CartridgeInfo, output: &PathBuf) {
     }
 }
 
-fn dump_rom_gba(device: &mut Device, _info: &CartridgeInfo, output: &PathBuf) {
+fn dump_rom_gba(device: &mut dyn CartridgeDevice, _info: &CartridgeInfo, output: &PathBuf) {
     eprintln!(
         "Dumping GBA ROM (reading {} max, will auto-trim)...",
         format_size(GBA_MAX_ROM)
     );
 
-    match device.read_rom(ChipType::Unknown, GBA_MAX_ROM, 0, |cur| {
+    match device.read_rom(ChipType::Unknown, GBA_MAX_ROM, 0, &|cur| {
         print_progress("Reading", cur, GBA_MAX_ROM);
     }) {
         Ok(rom) => {
@@ -135,6 +146,41 @@ fn dump_rom_gba(device: &mut Device, _info: &CartridgeInfo, output: &PathBuf) {
             process::exit(1);
         }
     }
+}
+
+fn dump_rom_snes(device: &mut dyn CartridgeDevice, info: &CartridgeInfo, output: &PathBuf) {
+    if info.rom_size == 0 {
+        eprintln!("Could not determine SNES ROM size from the cartridge signature.");
+        process::exit(1);
+    }
+
+    eprintln!("Dumping SNES ROM ({})...", format_size(info.rom_size));
+
+    let rom = match device.read_rom(ChipType::Unknown, info.rom_size, 0, &|cur| {
+        print_progress("Reading", cur, info.rom_size);
+    }) {
+        Ok(rom) => rom,
+        Err(e) => {
+            eprintln!("\nError: {e}");
+            process::exit(1);
+        }
+    };
+
+    // Parse the dumped header to confirm the dump and report details. This both
+    // validates the size the device reported and surfaces title/mapper/save info.
+    match cartridge::parse_snes_header(&rom) {
+        Some(header) => eprintln!("{header}"),
+        None => eprintln!(
+            "Warning: no valid SNES header found in the dump — the ROM may be \
+             incomplete or use an unrecognized mapper."
+        ),
+    }
+
+    fs::write(output, &rom).unwrap_or_else(|e| {
+        eprintln!("Error writing file: {e}");
+        process::exit(1);
+    });
+    eprintln!("Saved to {}", output.display());
 }
 
 fn main() {
@@ -170,27 +216,59 @@ fn main() {
                 }
             }
 
-            let info = CartridgeInfo::from_bytes(&data);
+            let mut info = CartridgeInfo::from_bytes(&data);
             if !info.present {
                 eprintln!("No cartridge inserted.");
                 process::exit(1);
             }
-            println!("{info}");
+
+            // Read just the cartridge header (not the whole ROM) to surface the full
+            // title. For SNES this also yields mapper + save size, so print the richer
+            // SnesHeader when it parses; otherwise fall back to the signature view.
+            match info.cart_type {
+                CartridgeType::SNES => {
+                    match device
+                        .read_header()
+                        .ok()
+                        .and_then(|buf| cartridge::parse_snes_header(&buf))
+                    {
+                        Some(header) => println!("{header}"),
+                        None => println!("{info}"),
+                    }
+                }
+                CartridgeType::GB => {
+                    if let Ok(buf) = device.read_header() {
+                        info.title = cartridge::parse_gb_title(&buf);
+                        info.type_label = Some(cartridge::parse_cgb_flag(&buf).to_string());
+                    }
+                    println!("{info}");
+                }
+                CartridgeType::GBA => {
+                    if let Ok(buf) = device.read_header() {
+                        info.title = cartridge::parse_gba_title(&buf);
+                    }
+                    println!("{info}");
+                }
+            }
         }
 
         Commands::DumpRom { output } => {
             let mut device = open_device();
-            let info = read_cart_info(&mut device);
+            let info = read_cart_info(device.as_mut());
 
             match info.cart_type {
-                CartridgeType::GB => dump_rom_gb(&mut device, &info, &output),
-                CartridgeType::GBA => dump_rom_gba(&mut device, &info, &output),
+                CartridgeType::GB => dump_rom_gb(device.as_mut(), &info, &output),
+                CartridgeType::GBA => dump_rom_gba(device.as_mut(), &info, &output),
+                CartridgeType::SNES => dump_rom_snes(device.as_mut(), &info, &output),
             }
         }
 
         Commands::ReadSave { output } => {
             let mut device = open_device();
-            let info = read_cart_info(&mut device);
+            if device.kind() == DeviceKind::SnOperator {
+                snes_not_ready("save read");
+            }
+            let info = read_cart_info(device.as_mut());
 
             match info.cart_type {
                 CartridgeType::GB => {
@@ -205,7 +283,7 @@ fn main() {
                         ChipType::Unknown,
                         info.rom_size,
                         info.ram_size,
-                        |cur| print_progress("Reading", cur, info.ram_size),
+                        &|cur| print_progress("Reading", cur, info.ram_size),
                     ) {
                         Ok(save) => {
                             fs::write(&output, &save).unwrap_or_else(|e| {
@@ -223,7 +301,7 @@ fn main() {
                 CartridgeType::GBA => {
                     eprintln!("Dumping ROM to detect save type...");
 
-                    let rom = match device.read_rom(ChipType::Unknown, GBA_MAX_ROM, 0, |cur| {
+                    let rom = match device.read_rom(ChipType::Unknown, GBA_MAX_ROM, 0, &|cur| {
                         print_progress("Reading ROM", cur, GBA_MAX_ROM);
                     }) {
                         Ok(r) => r,
@@ -244,7 +322,7 @@ fn main() {
                     eprintln!("Detected save: {:?}, {}", chip, format_size(save_size));
                     eprintln!("Reading save...");
 
-                    match device.read_save(chip, rom_size, save_size, |cur| {
+                    match device.read_save(chip, rom_size, save_size, &|cur| {
                         print_progress("Reading", cur, save_size);
                     }) {
                         Ok(save) => {
@@ -274,12 +352,16 @@ fn main() {
                         }
                     }
                 }
+                CartridgeType::SNES => snes_not_ready("save read"),
             }
         }
 
         Commands::WriteSave { input } => {
             let mut device = open_device();
-            let info = read_cart_info(&mut device);
+            if device.kind() == DeviceKind::SnOperator {
+                snes_not_ready("save write");
+            }
+            let info = read_cart_info(device.as_mut());
 
             let data = fs::read(&input).unwrap_or_else(|e| {
                 eprintln!("Error reading file: {e}");
@@ -303,7 +385,7 @@ fn main() {
 
                     eprintln!("Writing save ({})...", format_size(data.len() as u32));
 
-                    match device.write_save(ChipType::Unknown, info.rom_size, &data, |cur| {
+                    match device.write_save(ChipType::Unknown, info.rom_size, &data, &|cur| {
                         print_progress("Writing", cur, data.len() as u32);
                     }) {
                         Ok(()) => eprintln!("Save written successfully."),
@@ -316,7 +398,7 @@ fn main() {
                 CartridgeType::GBA => {
                     eprintln!("Dumping ROM to detect save type...");
 
-                    let rom = match device.read_rom(ChipType::Unknown, GBA_MAX_ROM, 0, |cur| {
+                    let rom = match device.read_rom(ChipType::Unknown, GBA_MAX_ROM, 0, &|cur| {
                         print_progress("Reading ROM", cur, GBA_MAX_ROM);
                     }) {
                         Ok(r) => r,
@@ -346,7 +428,7 @@ fn main() {
                     eprintln!("Detected save: {:?}, {}", chip, format_size(save_size));
                     eprintln!("Writing save ({})...", format_size(data.len() as u32));
 
-                    match device.write_save(chip, rom_size, &data, |cur| {
+                    match device.write_save(chip, rom_size, &data, &|cur| {
                         print_progress("Writing", cur, data.len() as u32);
                     }) {
                         Ok(()) => eprintln!("Save written successfully."),
@@ -356,6 +438,7 @@ fn main() {
                         }
                     }
                 }
+                CartridgeType::SNES => snes_not_ready("save write"),
             }
         }
 
@@ -375,9 +458,9 @@ fn main() {
 
             eprintln!("Writing {} to flash cart...", format_size(padded.len() as u32));
 
-            match device.write_rom(&padded, |cur| {
+            match device.write_rom(&padded, &|cur| {
                 print_progress("Writing", cur, padded.len() as u32);
-            }, |msg| {
+            }, &|msg| {
                 eprintln!("\r{}    ", msg);
             }) {
                 Ok(()) => {

@@ -6,13 +6,25 @@ use crate::device::ChipType;
 pub enum CartridgeType {
     GB,
     GBA,
+    /// SN Operator signature byte[2] == 0x50. The header (title/mapper/save) is
+    /// confirmed against the dumped ROM via parse_snes_header.
+    SNES,
 }
+
+/// Signature byte[2] cartridge-family markers reported by the Operator firmware.
+const SIG_MARKER_GB: u8 = 0x20;
+const SIG_MARKER_GBA: u8 = 0x30;
+const SIG_MARKER_SNES: u8 = 0x50;
+/// Offset in the SN Operator signature of the SNES ROM-size code (verified against
+/// a Desert Strike cartridge: signature[0x10] == header rom_size code 0x0A == 1 MB).
+const SIG_SNES_ROM_CODE: usize = 0x10;
 
 impl fmt::Display for CartridgeType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             CartridgeType::GB => write!(f, "GB/GBC"),
             CartridgeType::GBA => write!(f, "GBA"),
+            CartridgeType::SNES => write!(f, "SNES"),
         }
     }
 }
@@ -23,6 +35,12 @@ pub struct CartridgeInfo {
     pub cart_type: CartridgeType,
     pub rom_size: u32,
     pub ram_size: u32,
+    /// Full game title, read from the cartridge's internal header (not the signature).
+    /// `None` until populated by a header read.
+    pub title: Option<String>,
+    /// Overrides the displayed `Type:` line when a header read refines the family
+    /// (e.g. GB → GBC via the CGB flag). `None` falls back to `cart_type`.
+    pub type_label: Option<String>,
     // GB fields
     pub title_char: char,
     pub mbc_type: u8,
@@ -36,10 +54,11 @@ pub struct CartridgeInfo {
 impl CartridgeInfo {
     pub fn from_bytes(data: &[u8; 64]) -> Self {
         let present = data[3] != 0 || data[4] != 0;
-        let cart_type = if data[2] == 0x20 {
-            CartridgeType::GB
-        } else {
-            CartridgeType::GBA
+        let cart_type = match data[2] {
+            SIG_MARKER_GB => CartridgeType::GB,
+            SIG_MARKER_SNES => CartridgeType::SNES,
+            // GBA reports 0x30; treat any other present marker as GBA.
+            SIG_MARKER_GBA | _ => CartridgeType::GBA,
         };
 
         let title_char = data[0x0D] as char;
@@ -75,6 +94,20 @@ impl CartridgeInfo {
                 // GBA: device doesn't report sizes, they come from database or ROM scan
                 (0, 0)
             }
+            CartridgeType::SNES => {
+                // The SN Operator relays the SNES header's ROM-size code in the
+                // signature; size = 0x400 << code (e.g. 0x0A → 1 MB). We need this
+                // up front because ReadGame masks to the requested size. Save (SRAM)
+                // size isn't decoded from the signature yet, so it's derived from the
+                // dumped header by parse_snes_header instead.
+                let code = data[SIG_SNES_ROM_CODE];
+                let rom = if (0x08..=0x10).contains(&code) {
+                    0x400u32 << code
+                } else {
+                    0
+                };
+                (rom, 0)
+            }
         };
 
         Self {
@@ -82,6 +115,8 @@ impl CartridgeInfo {
             cart_type,
             rom_size,
             ram_size,
+            title: None,
+            type_label: None,
             title_char,
             mbc_type,
             header_checksum,
@@ -104,6 +139,7 @@ impl CartridgeInfo {
                 self.title_char,
                 String::from_utf8_lossy(&self.game_code),
             ),
+            CartridgeType::SNES => String::new(),
         }
     }
 
@@ -148,17 +184,26 @@ impl fmt::Display for CartridgeInfo {
             return write!(f, "No cartridge inserted");
         }
 
-        writeln!(f, "Type:            {}", self.cart_type)?;
-        writeln!(f, "Game ID:         {}", self.game_id())?;
+        match &self.type_label {
+            Some(label) => writeln!(f, "Type:            {label}")?,
+            None => writeln!(f, "Type:            {}", self.cart_type)?,
+        }
+        if let Some(title) = &self.title {
+            writeln!(f, "Title:           {}", title)?;
+        }
+        // SNES carts have no Operator-reported game ID (it comes from the dumped header).
+        if self.cart_type != CartridgeType::SNES {
+            writeln!(f, "Game ID:         {}", self.game_id())?;
+        }
 
         match self.cart_type {
             CartridgeType::GB => {
                 writeln!(f, "MBC:             {} (0x{:02X})", self.mbc_name(), self.mbc_type)?;
                 writeln!(f, "ROM Size:        {}", format_size(self.rom_size))?;
                 if self.ram_size > 0 {
-                    writeln!(f, "RAM Size:        {}", format_size(self.ram_size))?;
+                    writeln!(f, "Save:            {}", format_size(self.ram_size))?;
                 } else {
-                    writeln!(f, "RAM Size:        None")?;
+                    writeln!(f, "Save:            None")?;
                 }
                 write!(f, "Header Checksum: 0x{:02X}", self.header_checksum)?;
             }
@@ -170,9 +215,65 @@ impl fmt::Display for CartridgeInfo {
                 )?;
                 write!(f, "Region:          0x{:02X}", self.region)?;
             }
+            CartridgeType::SNES => {
+                if self.rom_size > 0 {
+                    writeln!(f, "ROM Size:        {}", format_size(self.rom_size))?;
+                }
+                write!(f, "(dump ROM to read title, mapper, and save size from the header)")?;
+            }
         }
 
         Ok(())
+    }
+}
+
+/// Extract the GB/GBC game title from a ROM header (bytes 0x0134..0x0143).
+/// Stops at the first non-printable byte, which naturally excludes the null
+/// padding and the CGB flag (0x80/0xC0) at 0x0143.
+pub fn parse_gb_title(rom: &[u8]) -> Option<String> {
+    if rom.len() < 0x144 {
+        return None;
+    }
+    let title: String = rom[0x134..0x144]
+        .iter()
+        .take_while(|&&b| (0x20..0x7f).contains(&b))
+        .map(|&b| b as char)
+        .collect();
+    let title = title.trim_end().to_string();
+    if title.is_empty() {
+        None
+    } else {
+        Some(title)
+    }
+}
+
+/// Extract the GBA game title from a ROM header (bytes 0xA0..0xAC).
+/// The title is up to 12 bytes of uppercase ASCII, null-padded.
+pub fn parse_gba_title(rom: &[u8]) -> Option<String> {
+    if rom.len() < 0xAC {
+        return None;
+    }
+    let title: String = rom[0xA0..0xAC]
+        .iter()
+        .take_while(|&&b| (0x20..0x7f).contains(&b))
+        .map(|&b| b as char)
+        .collect();
+    let title = title.trim_end().to_string();
+    if title.is_empty() {
+        None
+    } else {
+        Some(title)
+    }
+}
+
+/// Classify a GB-family cartridge as GB or GBC from the CGB flag at 0x0143.
+/// `0xC0` = CGB-only, `0x80` = CGB-enhanced but DMG-compatible (dual-mode),
+/// anything else = original Game Boy. Falls back to "GB" if the header is short.
+pub fn parse_cgb_flag(rom: &[u8]) -> &'static str {
+    match rom.get(0x143) {
+        Some(0xC0) => "GBC",
+        Some(0x80) => "GB/GBC",
+        _ => "GB",
     }
 }
 
@@ -277,6 +378,152 @@ pub fn trim_gba_rom(rom: &[u8]) -> usize {
     }
 
     rom.len()
+}
+
+/// SNES memory map / mapper mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SnesMapper {
+    LoRom,
+    HiRom,
+    ExHiRom,
+}
+
+impl fmt::Display for SnesMapper {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            SnesMapper::LoRom => write!(f, "LoROM"),
+            SnesMapper::HiRom => write!(f, "HiROM"),
+            SnesMapper::ExHiRom => write!(f, "ExHiROM"),
+        }
+    }
+}
+
+/// Parsed SNES internal cartridge header.
+#[derive(Debug, Clone)]
+#[allow(dead_code)] // save_chip is consumed by the SNES save path, pending hardware
+pub struct SnesHeader {
+    pub title: String,
+    pub mapper: SnesMapper,
+    pub rom_size: u32,
+    pub ram_size: u32,
+    pub save_chip: ChipType,
+}
+
+impl fmt::Display for SnesHeader {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(f, "Type:            SNES")?;
+        writeln!(f, "Title:           {}", self.title.trim())?;
+        writeln!(f, "Mapper:          {}", self.mapper)?;
+        writeln!(f, "ROM Size:        {}", format_size(self.rom_size))?;
+        if self.ram_size > 0 {
+            write!(f, "Save:            {}", format_size(self.ram_size))
+        } else {
+            write!(f, "Save:            None")
+        }
+    }
+}
+
+// Field offsets within the SNES header (relative to the header base).
+const SNES_HDR_TITLE: usize = 0x00;
+const SNES_HDR_MAP_MODE: usize = 0x15;
+const SNES_HDR_CART_TYPE: usize = 0x16;
+const SNES_HDR_ROM_SIZE: usize = 0x17;
+const SNES_HDR_RAM_SIZE: usize = 0x18;
+const SNES_HDR_CHECKSUM_COMP: usize = 0x1C;
+const SNES_HDR_CHECKSUM: usize = 0x1E;
+const SNES_HDR_LEN: usize = 0x20;
+
+// Candidate header base offsets by mapper.
+const LOROM_BASE: usize = 0x7FC0;
+const HIROM_BASE: usize = 0xFFC0;
+const EXHIROM_BASE: usize = 0x40FFC0;
+
+/// Score how well the header at `base` validates. Higher is better; `None` if the
+/// region isn't present. The checksum/complement pair summing to 0xFFFF is the
+/// strongest signal; a sane map-mode byte adds confidence.
+fn snes_header_score(rom: &[u8], base: usize, expect_map_hi_bit: u8) -> Option<u32> {
+    if base + SNES_HDR_LEN > rom.len() {
+        return None;
+    }
+    let h = &rom[base..base + SNES_HDR_LEN];
+    let mut score = 0;
+
+    let checksum = u16::from_le_bytes([h[SNES_HDR_CHECKSUM], h[SNES_HDR_CHECKSUM + 1]]);
+    let complement =
+        u16::from_le_bytes([h[SNES_HDR_CHECKSUM_COMP], h[SNES_HDR_CHECKSUM_COMP + 1]]);
+    if checksum ^ complement == 0xFFFF && checksum != 0 {
+        score += 4;
+    }
+
+    // Map-mode low nibble: 0 = LoROM, 1 = HiROM, 5 = ExHiROM. High nibble 0x2/0x3.
+    let map = h[SNES_HDR_MAP_MODE];
+    if (map & 0xF0) == 0x20 || (map & 0xF0) == 0x30 {
+        score += 1;
+    }
+    if (map & 0x0F) == expect_map_hi_bit {
+        score += 2;
+    }
+
+    // Title bytes should be printable ASCII.
+    let printable = h[SNES_HDR_TITLE..SNES_HDR_TITLE + 21]
+        .iter()
+        .filter(|&&b| (0x20..0x7f).contains(&b))
+        .count();
+    if printable >= 16 {
+        score += 2;
+    }
+
+    // ROM size code should be plausible (256KB..64MB → 0x08..0x10).
+    let rom_code = h[SNES_HDR_ROM_SIZE];
+    if (0x08..=0x10).contains(&rom_code) {
+        score += 1;
+    }
+
+    Some(score)
+}
+
+/// Parse the internal header of a dumped SNES ROM, detecting the mapper and reading
+/// ROM/save sizes. Returns `None` if no plausible header is found.
+///
+/// Used to print title/mapper/save details after a SNES dump, and as a cross-check
+/// on the ROM-size code the SN Operator reports in its signature.
+pub fn parse_snes_header(rom: &[u8]) -> Option<SnesHeader> {
+    // Strip a 512-byte SMC copier header if present (raw dumps won't have one).
+    let rom = if rom.len() % 1024 == 512 { &rom[512..] } else { rom };
+
+    let candidates = [
+        (LOROM_BASE, SnesMapper::LoRom, 0x0u8),
+        (HIROM_BASE, SnesMapper::HiRom, 0x1u8),
+        (EXHIROM_BASE, SnesMapper::ExHiRom, 0x5u8),
+    ];
+
+    let (base, mapper, _) = candidates
+        .into_iter()
+        .filter_map(|(base, mapper, bit)| {
+            snes_header_score(rom, base, bit).map(|s| (s, base, mapper))
+        })
+        // Require a minimum confidence so we don't latch onto garbage.
+        .filter(|(score, _, _)| *score >= 6)
+        .max_by_key(|(score, _, _)| *score)
+        .map(|(_, base, mapper)| (base, mapper, ()))?;
+
+    let h = &rom[base..base + SNES_HDR_LEN];
+
+    let title = String::from_utf8_lossy(&h[SNES_HDR_TITLE..SNES_HDR_TITLE + 21]).into_owned();
+
+    let rom_code = h[SNES_HDR_ROM_SIZE];
+    let rom_size = 1024u32 << rom_code;
+
+    let ram_code = h[SNES_HDR_RAM_SIZE];
+    let ram_size = if ram_code == 0 { 0 } else { 1024u32 << ram_code };
+
+    // SNES battery saves are SRAM. The cart-type byte's low nibble distinguishes
+    // ROM (0) / ROM+RAM (1) / ROM+RAM+battery (2); coprocessor carts use the high
+    // nibble but still back saves with SRAM.
+    let save_chip = if ram_size > 0 { ChipType::Sram } else { ChipType::Unknown };
+    let _cart_type = h[SNES_HDR_CART_TYPE];
+
+    Some(SnesHeader { title, mapper, rom_size, ram_size, save_chip })
 }
 
 pub fn format_size(bytes: u32) -> String {
