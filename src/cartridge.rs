@@ -41,6 +41,14 @@ pub struct CartridgeInfo {
     /// Overrides the displayed `Type:` line when a header read refines the family
     /// (e.g. GB → GBC via the CGB flag). `None` falls back to `cart_type`.
     pub type_label: Option<String>,
+    /// Decoded region/destination, read from the cartridge's internal header.
+    /// `None` until populated by a header read (GB destination / GBA game-code letter).
+    pub region_label: Option<String>,
+    /// Whether the cartridge's stored header checksum matches one computed from the
+    /// header bytes. `None` until a header read lets us verify it (GB/GBA).
+    pub checksum_valid: Option<bool>,
+    /// Mask ROM version (GB 0x14C / GBA 0xBC). `None` until a header read.
+    pub version: Option<u8>,
     // GB fields
     pub title_char: char,
     pub mbc_type: u8,
@@ -117,6 +125,9 @@ impl CartridgeInfo {
             ram_size,
             title: None,
             type_label: None,
+            region_label: None,
+            checksum_valid: None,
+            version: None,
             title_char,
             mbc_type,
             header_checksum,
@@ -140,6 +151,16 @@ impl CartridgeInfo {
                 String::from_utf8_lossy(&self.game_code),
             ),
             CartridgeType::SNES => String::new(),
+        }
+    }
+
+    /// Format the header checksum with a validity verdict when we've been able to
+    /// recompute it from the header bytes (GB/GBA).
+    fn checksum_line(&self) -> String {
+        match self.checksum_valid {
+            Some(true) => format!("0x{:02X} (valid)", self.header_checksum),
+            Some(false) => format!("0x{:02X} (INVALID)", self.header_checksum),
+            None => format!("0x{:02X}", self.header_checksum),
         }
     }
 
@@ -191,8 +212,9 @@ impl fmt::Display for CartridgeInfo {
         if let Some(title) = &self.title {
             writeln!(f, "Title:           {}", title)?;
         }
-        // SNES carts have no Operator-reported game ID (it comes from the dumped header).
-        if self.cart_type != CartridgeType::SNES {
+        // GB has a synthesized Game ID; GBA shows the real 4-char Game Code below
+        // instead (printing both was redundant); SNES has neither in the signature.
+        if self.cart_type == CartridgeType::GB {
             writeln!(f, "Game ID:         {}", self.game_id())?;
         }
 
@@ -205,15 +227,31 @@ impl fmt::Display for CartridgeInfo {
                 } else {
                     writeln!(f, "Save:            None")?;
                 }
-                write!(f, "Header Checksum: 0x{:02X}", self.header_checksum)?;
+                if let Some(region) = &self.region_label {
+                    writeln!(f, "Region:          {region}")?;
+                }
+                if let Some(version) = self.version {
+                    writeln!(f, "Version:         {version}")?;
+                }
+                write!(f, "Header Checksum: {}", self.checksum_line())?;
             }
             CartridgeType::GBA => {
+                // Full 4-char game code (AGB-XXXY): the signature's 3-byte code plus
+                // the destination letter held in `region`.
                 writeln!(
                     f,
-                    "Game Code:       {}",
-                    String::from_utf8_lossy(&self.game_code)
+                    "Game Code:       {}{}",
+                    String::from_utf8_lossy(&self.game_code),
+                    self.region as char,
                 )?;
-                write!(f, "Region:          0x{:02X}", self.region)?;
+                match &self.region_label {
+                    Some(region) => writeln!(f, "Region:          {region}")?,
+                    None => writeln!(f, "Region:          0x{:02X}", self.region)?,
+                }
+                if let Some(version) = self.version {
+                    writeln!(f, "Version:         {version}")?;
+                }
+                write!(f, "Header Checksum: {}", self.checksum_line())?;
             }
             CartridgeType::SNES => {
                 if self.rom_size > 0 {
@@ -264,6 +302,134 @@ pub fn parse_gba_title(rom: &[u8]) -> Option<String> {
     } else {
         Some(title)
     }
+}
+
+/// Decode the GB/GBC destination code at 0x014A. The Game Boy header only
+/// distinguishes Japan from everywhere else (Pan Docs): 0x00 = Japan, 0x01 =
+/// Non-Japan (overseas/international). Returns `None` if the header is short.
+pub fn parse_gb_region(rom: &[u8]) -> Option<&'static str> {
+    match rom.get(0x14A) {
+        Some(0x00) => Some("Japan"),
+        Some(0x01) => Some("Non-Japan (International)"),
+        Some(_) => Some("Unknown"),
+        None => None,
+    }
+}
+
+/// Decode the GBA destination from the 4th character of the game code at 0xAF
+/// (AGB-XXXY, where Y is the destination letter). Returns `None` if the header
+/// is short or the letter isn't printable.
+///
+/// NOTE: unlike SNES, the GBA has no PAL/NTSC hardware split, so this letter is a
+/// market/language code, not a hard region. In particular `E` is the *English*
+/// release code used for carts sold in BOTH North America and Europe (e.g.
+/// "Pokemon Ruby (USA, Europe)" is AXVE) — it does not mean USA-only. Telling
+/// USA from Europe for an `E` cart isn't possible from the header; it needs a
+/// CRC match against a No-Intro-style database.
+pub fn parse_gba_region(rom: &[u8]) -> Option<String> {
+    let c = *rom.get(0xAF)?;
+    if !(0x20..0x7f).contains(&c) {
+        return None;
+    }
+    let name = match c {
+        b'J' => "Japan",
+        b'E' => "USA/Europe (English)",
+        b'P' => "Europe",
+        b'D' => "Germany",
+        b'F' => "France",
+        b'I' => "Italy",
+        b'S' => "Spain",
+        b'H' => "Netherlands",
+        b'K' => "Korea",
+        b'X' => "Europe",
+        b'U' => "Australia",
+        b'A' => "Asia",
+        b'C' => "China",
+        _ => "Unknown",
+    };
+    Some(format!("{name} ({})", c as char))
+}
+
+/// Decode the SNES destination/region code (header byte 0x19). Values per the
+/// SNESdev ROM-header table; 0x00/0x01 are NTSC, the rest are PAL variants.
+pub fn snes_region_name(code: u8) -> &'static str {
+    match code {
+        0x00 => "Japan",
+        0x01 => "USA",
+        0x02 => "Europe/PAL",
+        0x03 => "Scandinavia",
+        0x04 => "Finland",
+        0x05 => "Denmark",
+        0x06 => "France (PAL)",
+        0x07 => "Netherlands",
+        0x08 => "Spain",
+        0x09 => "Germany",
+        0x0A => "Italy",
+        0x0B => "China",
+        0x0C => "Indonesia",
+        0x0D => "South Korea",
+        0x0E => "Common",
+        0x0F => "Canada",
+        0x10 => "Brazil",
+        0x11 => "Australia",
+        _ => "Unknown",
+    }
+}
+
+/// Compute the GB/GBC header checksum (the value stored at 0x14D). Per Pan Docs:
+/// `x = 0; for 0x134..=0x14C: x = x - byte - 1`. Compare against rom[0x14D] to
+/// validate. Returns `None` if the header is too short.
+pub fn gb_header_checksum(rom: &[u8]) -> Option<u8> {
+    if rom.len() < 0x14D {
+        return None;
+    }
+    let mut x: u8 = 0;
+    for &b in &rom[0x134..=0x14C] {
+        x = x.wrapping_sub(b).wrapping_sub(1);
+    }
+    Some(x)
+}
+
+/// Compute the GBA header checksum (the value stored at 0xBD). Per GBATEK:
+/// `chk = 0; for 0xA0..=0xBC: chk = chk - byte; chk = chk - 0x19`. Compare against
+/// rom[0xBD] to validate. Returns `None` if the header is too short.
+pub fn gba_header_checksum(rom: &[u8]) -> Option<u8> {
+    if rom.len() < 0xBD {
+        return None;
+    }
+    let mut chk: u8 = 0;
+    for &b in &rom[0xA0..=0xBC] {
+        chk = chk.wrapping_sub(b);
+    }
+    Some(chk.wrapping_sub(0x19))
+}
+
+/// Decode the SNES coprocessor from the cart-type byte (header 0x16) and, for the
+/// Custom family, the chipset subtype byte (header base - 1, i.e. 0xFFBF/0x7FBF).
+/// Returns `None` when the low nibble shows no coprocessor present. Family per the
+/// SNESdev ROM-header table.
+pub fn snes_coprocessor(cart_type: u8, subtype: u8) -> Option<&'static str> {
+    // Low nibble 0x3..=0x6 means a coprocessor is present.
+    if !matches!(cart_type & 0x0F, 0x03..=0x06) {
+        return None;
+    }
+    Some(match cart_type >> 4 {
+        0x0 => "DSP",
+        0x1 => "SuperFX (GSU)",
+        0x2 => "OBC1",
+        0x3 => "SA-1",
+        0x4 => "S-DD1",
+        0x5 => "S-RTC",
+        0xE => "Other (SGB/Satellaview)",
+        0xF => match subtype {
+            0x00 => "SPC7110",
+            0x01 => "ST010/ST011",
+            0x02 => "ST018",
+            0x03 => "CX4",
+            _ => "Custom",
+        },
+        _ => "Unknown",
+    })
 }
 
 /// Classify a GB-family cartridge as GB or GBC from the CGB flag at 0x0143.
@@ -407,6 +573,17 @@ pub struct SnesHeader {
     pub rom_size: u32,
     pub ram_size: u32,
     pub save_chip: ChipType,
+    /// Raw destination/region code (header byte 0x19); decode with snes_region_name.
+    pub region: u8,
+    /// Coprocessor name (DSP/SA-1/SuperFX/…) decoded from the cart-type byte, if any.
+    pub coprocessor: Option<&'static str>,
+    /// Mask ROM version (header byte 0x1B).
+    pub version: u8,
+    /// Stored checksum and its complement (header 0x1E/0x1C). `checksum ^ complement
+    /// == 0xFFFF` is a header-only self-consistency check (the true checksum vs the
+    /// whole-ROM byte sum needs a full dump).
+    pub checksum: u16,
+    pub complement: u16,
 }
 
 impl fmt::Display for SnesHeader {
@@ -414,12 +591,25 @@ impl fmt::Display for SnesHeader {
         writeln!(f, "Type:            SNES")?;
         writeln!(f, "Title:           {}", self.title.trim())?;
         writeln!(f, "Mapper:          {}", self.mapper)?;
+        if let Some(co) = self.coprocessor {
+            writeln!(f, "Coprocessor:     {co}")?;
+        }
         writeln!(f, "ROM Size:        {}", format_size(self.rom_size))?;
         if self.ram_size > 0 {
-            write!(f, "Save:            {}", format_size(self.ram_size))
+            writeln!(f, "Save:            {}", format_size(self.ram_size))?;
         } else {
-            write!(f, "Save:            None")
+            writeln!(f, "Save:            None")?;
         }
+        writeln!(f, "Region:          {} (0x{:02X})", snes_region_name(self.region), self.region)?;
+        writeln!(f, "Version:         {}", self.version)?;
+        // Header-only self-consistency; full verification needs the whole-ROM sum.
+        let ok = self.checksum ^ self.complement == 0xFFFF;
+        write!(
+            f,
+            "Checksum:        0x{:04X} (complement {})",
+            self.checksum,
+            if ok { "OK" } else { "BAD" }
+        )
     }
 }
 
@@ -429,6 +619,8 @@ const SNES_HDR_MAP_MODE: usize = 0x15;
 const SNES_HDR_CART_TYPE: usize = 0x16;
 const SNES_HDR_ROM_SIZE: usize = 0x17;
 const SNES_HDR_RAM_SIZE: usize = 0x18;
+const SNES_HDR_REGION: usize = 0x19;
+const SNES_HDR_VERSION: usize = 0x1B;
 const SNES_HDR_CHECKSUM_COMP: usize = 0x1C;
 const SNES_HDR_CHECKSUM: usize = 0x1E;
 const SNES_HDR_LEN: usize = 0x20;
@@ -521,9 +713,30 @@ pub fn parse_snes_header(rom: &[u8]) -> Option<SnesHeader> {
     // ROM (0) / ROM+RAM (1) / ROM+RAM+battery (2); coprocessor carts use the high
     // nibble but still back saves with SRAM.
     let save_chip = if ram_size > 0 { ChipType::Sram } else { ChipType::Unknown };
-    let _cart_type = h[SNES_HDR_CART_TYPE];
+    let region = h[SNES_HDR_REGION];
+    let version = h[SNES_HDR_VERSION];
 
-    Some(SnesHeader { title, mapper, rom_size, ram_size, save_chip })
+    // Coprocessor: cart-type byte plus the subtype byte one before the header base
+    // (0xFFBF / 0x7FBF), only meaningful for the Custom family.
+    let cart_type = h[SNES_HDR_CART_TYPE];
+    let subtype = if base > 0 { rom[base - 1] } else { 0 };
+    let coprocessor = snes_coprocessor(cart_type, subtype);
+
+    let complement = u16::from_le_bytes([h[SNES_HDR_CHECKSUM_COMP], h[SNES_HDR_CHECKSUM_COMP + 1]]);
+    let checksum = u16::from_le_bytes([h[SNES_HDR_CHECKSUM], h[SNES_HDR_CHECKSUM + 1]]);
+
+    Some(SnesHeader {
+        title,
+        mapper,
+        rom_size,
+        ram_size,
+        save_chip,
+        region,
+        coprocessor,
+        version,
+        checksum,
+        complement,
+    })
 }
 
 pub fn format_size(bytes: u32) -> String {

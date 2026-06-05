@@ -362,6 +362,94 @@ fn test_parse_cgb_flag() {
 }
 
 #[test]
+fn test_parse_gb_region() {
+    let mut rom = vec![0u8; 0x4000];
+
+    rom[0x14A] = 0x00; // Japan
+    assert_eq!(parse_gb_region(&rom), Some("Japan"));
+
+    rom[0x14A] = 0x01; // overseas
+    assert_eq!(parse_gb_region(&rom), Some("Non-Japan (International)"));
+
+    rom[0x14A] = 0x7F; // undefined
+    assert_eq!(parse_gb_region(&rom), Some("Unknown"));
+
+    // Too short to reach 0x14A.
+    assert_eq!(parse_gb_region(&[0u8; 16]), None);
+}
+
+#[test]
+fn test_parse_gba_region() {
+    // Region is the 4th game-code char at 0xAF (AGB-XXXY).
+    let mut rom = vec![0u8; 0x4000];
+
+    rom[0xAF] = b'P';
+    assert_eq!(parse_gba_region(&rom).as_deref(), Some("Europe (P)"));
+
+    // 'E' is the English-market code (NA + Europe), not USA-only.
+    rom[0xAF] = b'E';
+    assert_eq!(parse_gba_region(&rom).as_deref(), Some("USA/Europe (English) (E)"));
+
+    rom[0xAF] = b'J';
+    assert_eq!(parse_gba_region(&rom).as_deref(), Some("Japan (J)"));
+
+    rom[0xAF] = b'Q'; // printable but unmapped
+    assert_eq!(parse_gba_region(&rom).as_deref(), Some("Unknown (Q)"));
+
+    rom[0xAF] = 0x00; // non-printable
+    assert_eq!(parse_gba_region(&rom), None);
+
+    assert_eq!(parse_gba_region(&[0u8; 16]), None);
+}
+
+#[test]
+fn test_gb_header_checksum() {
+    // 0x134..=0x14C is 25 bytes; all-zero → x = -25 = 0xE7.
+    let rom = vec![0u8; 0x4000];
+    assert_eq!(gb_header_checksum(&rom), Some(0xE7));
+
+    // Validity round-trip: stash the computed value at 0x14D.
+    let mut rom2 = vec![0u8; 0x4000];
+    rom2[0x140] = 0xAB;
+    rom2[0x14D] = gb_header_checksum(&rom2).unwrap();
+    assert_eq!(gb_header_checksum(&rom2), Some(rom2[0x14D]));
+
+    assert_eq!(gb_header_checksum(&[0u8; 16]), None);
+}
+
+#[test]
+fn test_gba_header_checksum() {
+    // 0xA0..=0xBC is 29 bytes; all-zero → chk = -0x19 = 0xE7.
+    let rom = vec![0u8; 0x4000];
+    assert_eq!(gba_header_checksum(&rom), Some(0xE7));
+
+    assert_eq!(gba_header_checksum(&[0u8; 16]), None);
+}
+
+#[test]
+fn test_snes_coprocessor() {
+    // Low nibble 0x3..=0x6 means a coprocessor is present.
+    assert_eq!(snes_coprocessor(0x05, 0x00), Some("DSP")); // SMK: DSP + RAM + battery
+    assert_eq!(snes_coprocessor(0x15, 0x00), Some("SuperFX (GSU)"));
+    assert_eq!(snes_coprocessor(0x35, 0x00), Some("SA-1"));
+    assert_eq!(snes_coprocessor(0xF3, 0x03), Some("CX4")); // custom + subtype
+    assert_eq!(snes_coprocessor(0xF6, 0x00), Some("SPC7110"));
+    // No coprocessor (low nibble 0/1/2).
+    assert_eq!(snes_coprocessor(0x00, 0x00), None);
+    assert_eq!(snes_coprocessor(0x02, 0x00), None);
+}
+
+#[test]
+fn test_snes_region_name() {
+    assert_eq!(snes_region_name(0x00), "Japan");
+    assert_eq!(snes_region_name(0x01), "USA");
+    assert_eq!(snes_region_name(0x02), "Europe/PAL");
+    assert_eq!(snes_region_name(0x09), "Germany");
+    assert_eq!(snes_region_name(0x11), "Australia");
+    assert_eq!(snes_region_name(0xFE), "Unknown");
+}
+
+#[test]
 fn test_parse_gba_title() {
     // Title lives at 0xA0, up to 12 bytes, uppercase ASCII, null-padded.
     let mut rom = vec![0u8; 0x4000];

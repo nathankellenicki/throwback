@@ -229,12 +229,26 @@ fn main() {
                     if let Ok(buf) = device.read_header() {
                         info.title = cartridge::parse_gb_title(&buf);
                         info.type_label = Some(cartridge::parse_cgb_flag(&buf).to_string());
+                        info.region_label = cartridge::parse_gb_region(&buf).map(String::from);
+                        if buf.len() > 0x14D {
+                            info.header_checksum = buf[0x14D];
+                            info.checksum_valid =
+                                cartridge::gb_header_checksum(&buf).map(|c| c == buf[0x14D]);
+                            info.version = Some(buf[0x14C]);
+                        }
                     }
                     println!("{info}");
                 }
                 CartridgeType::GBA => {
                     if let Ok(buf) = device.read_header() {
                         info.title = cartridge::parse_gba_title(&buf);
+                        info.region_label = cartridge::parse_gba_region(&buf);
+                        if buf.len() > 0xBD {
+                            info.header_checksum = buf[0xBD];
+                            info.checksum_valid =
+                                cartridge::gba_header_checksum(&buf).map(|c| c == buf[0xBD]);
+                            info.version = Some(buf[0xBC]);
+                        }
                     }
                     println!("{info}");
                 }
