@@ -14,7 +14,13 @@ const CMD_WRITE_GAME: u8 = 0x01;
 const CMD_READ_SAVE: u8 = 0x02;
 const CMD_WRITE_SAVE: u8 = 0x03;
 const CMD_READ_SIGNATURE: u8 = 0x04;
+const CMD_READ_RTC: u8 = 0x09;
+const CMD_WRITE_RTC: u8 = 0x10;
 const CMD_DETECT_FLASHCART: u8 = 0x15;
+
+/// MBC3 RTC payload: 5 registers (sec/min/hour/day-low/day-ctrl), current + latched,
+/// each as a u32 little-endian (the standard emulator .rtc layout). 10 × 4 = 40 bytes.
+const RTC_PAYLOAD_LEN: usize = 40;
 
 // USB identifiers (VID 0x16D0 firmware 9+, 0x1D50 older).
 const VID_NEW: u16 = 0x16D0;
@@ -57,6 +63,8 @@ pub enum DeviceError {
     Io(#[from] std::io::Error),
     #[error("No response from device")]
     NoResponse,
+    #[error("{0}")]
+    Unsupported(&'static str),
 }
 
 /// Check if a chunk looks like GBA open bus (sequential u16 from 0).
@@ -122,6 +130,22 @@ pub trait CartridgeDevice {
         progress: &dyn Fn(u32),
         erase_progress: &dyn Fn(&str),
     ) -> Result<(), DeviceError>;
+
+    /// Read the MBC3 real-time clock (40-byte payload: 5 registers, current +
+    /// latched). Only meaningful on GB carts with an RTC; unsupported devices error.
+    fn read_rtc(&mut self, _rom_size: u32, _save_size: u32) -> Result<Vec<u8>, DeviceError> {
+        Err(DeviceError::Unsupported("RTC is not supported on this device"))
+    }
+
+    /// Write the MBC3 real-time clock (40-byte payload, same layout as read_rtc).
+    fn write_rtc(
+        &mut self,
+        _rom_size: u32,
+        _save_size: u32,
+        _data: &[u8],
+    ) -> Result<(), DeviceError> {
+        Err(DeviceError::Unsupported("RTC is not supported on this device"))
+    }
 }
 
 /// Find the first Operator serial port, returning its name and the device kind.
@@ -324,6 +348,51 @@ impl Serial {
             progress(((i + 1) * PACKET_SIZE).min(data.len()) as u32);
         }
 
+        Ok(())
+    }
+
+    /// Read the MBC3 RTC (GB Operator). Framing matches the other reads: send
+    /// ReadRTC, drain the 512-byte READY lead-in, read the 40-byte payload, drain
+    /// the trailing padding + DONE frame. Verified on a Pokemon Crystal cartridge:
+    /// READY `C0 DE 00 09 F6` / DONE `C0 DE 01 09 F6`, payload = 10 × u32-LE (5 RTC
+    /// registers, current + latched).
+    fn read_rtc_data(&mut self, rom_size: u32, save_size: u32) -> Result<Vec<u8>, DeviceError> {
+        self.read_until_timeout(); // flush stale
+
+        let packet = build_command(CMD_READ_RTC, ChipType::Unknown, rom_size, save_size);
+        self.send(&packet)?;
+        self.drain(512)?; // READY frame + lead-in
+
+        let mut buf = [0u8; RTC_PAYLOAD_LEN];
+        self.port.read_exact(&mut buf)?;
+
+        let _ = self.read_until_timeout(); // padding + DONE frame + trailer
+        Ok(buf.to_vec())
+    }
+
+    /// Write the MBC3 RTC (GB Operator). Symmetric to `read_rtc_data`: send
+    /// WriteRTC, drain the 512-byte READY lead-in, stream the 40-byte payload, drain
+    /// the DONE frame + trailer. Verified (framing) on Pokemon Crystal: READY
+    /// `C0 DE 00 10 EF` / DONE `C0 DE 01 10 EF`. (A cart with a dead RTC battery
+    /// won't persist the values, but the transfer completes.)
+    fn write_rtc_data(
+        &mut self,
+        rom_size: u32,
+        save_size: u32,
+        data: &[u8],
+    ) -> Result<(), DeviceError> {
+        self.read_until_timeout(); // flush stale
+
+        let packet = build_command(CMD_WRITE_RTC, ChipType::Unknown, rom_size, save_size);
+        self.send(&packet)?;
+        self.drain(512)?; // READY frame + lead-in
+
+        self.port.set_timeout(Duration::from_secs(5))?;
+        self.port.write_all(data)?;
+        self.port.flush()?;
+        self.port.set_timeout(TIMEOUT)?;
+
+        let _ = self.drain(512); // DONE frame + trailer
         Ok(())
     }
 
@@ -540,6 +609,14 @@ impl CartridgeDevice for LegacyDevice {
 
     fn write_rom(&mut self, data: &[u8], progress: &dyn Fn(u32), erase_progress: &dyn Fn(&str)) -> Result<(), DeviceError> {
         self.io.write_game(data, progress, erase_progress)
+    }
+
+    fn read_rtc(&mut self, rom_size: u32, save_size: u32) -> Result<Vec<u8>, DeviceError> {
+        self.io.read_rtc_data(rom_size, save_size)
+    }
+
+    fn write_rtc(&mut self, rom_size: u32, save_size: u32, data: &[u8]) -> Result<(), DeviceError> {
+        self.io.write_rtc_data(rom_size, save_size, data)
     }
 }
 

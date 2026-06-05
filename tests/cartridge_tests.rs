@@ -403,6 +403,34 @@ fn test_parse_gba_region() {
 }
 
 #[test]
+fn test_rtc_data() {
+    // 5 registers (sec/min/hour/day-low/day-ctrl) as u32-LE, current + latched.
+    let payload: Vec<u8> = [10u32, 30, 12, 5, 0, 10, 30, 12, 5, 0]
+        .iter()
+        .flat_map(|v| v.to_le_bytes())
+        .collect();
+    let rtc = RtcData::parse(&payload).unwrap();
+    assert_eq!((rtc.seconds, rtc.minutes, rtc.hours, rtc.days), (10, 30, 12, 5));
+    assert!(rtc.is_valid());
+    // Round-trips back to the same 40 bytes.
+    assert_eq!(rtc.to_payload(), payload);
+
+    // Day high bit (0x100) + carry flag from the control register.
+    let mut p = vec![0u8; 40];
+    p[3 * 4] = 0xFF; // day-low = 255
+    p[4 * 4] = 0x81; // control: day bit 8 set + carry
+    let r = RtcData::parse(&p).unwrap();
+    assert_eq!(r.days, 511);
+    assert!(r.day_carry && !r.halt);
+
+    // Out-of-range values (dead battery) fail validation.
+    let dead = RtcData { seconds: 47, minutes: 63, hours: 31, days: 511, halt: false, day_carry: true };
+    assert!(!dead.is_valid());
+
+    assert_eq!(RtcData::parse(&[0u8; 10]), None);
+}
+
+#[test]
 fn test_gb_header_checksum() {
     // 0x134..=0x14C is 25 bytes; all-zero → x = -25 = 0xE7.
     let rom = vec![0u8; 0x4000];

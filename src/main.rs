@@ -45,6 +45,26 @@ enum Commands {
         /// Input file path
         input: PathBuf,
     },
+    /// Read the cartridge's real-time clock (MBC3 carts)
+    ReadRtc {
+        /// Optional file to save the raw 40-byte RTC payload as a backup
+        #[arg(long)]
+        output: Option<PathBuf>,
+    },
+    /// Write the cartridge's real-time clock (MBC3 carts)
+    WriteRtc {
+        /// Restore from a raw 40-byte .rtc backup (takes precedence over the flags)
+        #[arg(long)]
+        input: Option<PathBuf>,
+        #[arg(long, default_value_t = 0)]
+        days: u16,
+        #[arg(long, default_value_t = 0)]
+        hours: u8,
+        #[arg(long, default_value_t = 0)]
+        minutes: u8,
+        #[arg(long, default_value_t = 0)]
+        seconds: u8,
+    },
 }
 
 fn open_device() -> Box<dyn CartridgeDevice> {
@@ -547,5 +567,109 @@ fn main() {
                 }
             }
         }
+
+        Commands::ReadRtc { output } => {
+            let mut device = open_device();
+            let info = read_cart_info(device.as_mut());
+            require_rtc(&info);
+
+            match device.read_rtc(info.rom_size, info.ram_size) {
+                Ok(payload) => {
+                    match cartridge::RtcData::parse(&payload) {
+                        Some(rtc) => {
+                            println!("RTC: {rtc}");
+                            if !rtc.is_valid() {
+                                eprintln!(
+                                    "Warning: RTC values are out of range — the cartridge \
+                                     battery is likely dead."
+                                );
+                            }
+                        }
+                        None => eprintln!("Could not parse RTC payload ({} bytes).", payload.len()),
+                    }
+                    if let Some(path) = output {
+                        fs::write(&path, &payload).unwrap_or_else(|e| {
+                            eprintln!("Error writing file: {e}");
+                            process::exit(1);
+                        });
+                        eprintln!("Saved raw RTC ({} bytes) to {}", payload.len(), path.display());
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Error: {e}");
+                    process::exit(1);
+                }
+            }
+        }
+
+        Commands::WriteRtc { input, days, hours, minutes, seconds } => {
+            let mut device = open_device();
+            let info = read_cart_info(device.as_mut());
+            require_rtc(&info);
+
+            let payload = match input {
+                Some(path) => {
+                    let data = fs::read(&path).unwrap_or_else(|e| {
+                        eprintln!("Error reading file: {e}");
+                        process::exit(1);
+                    });
+                    if data.len() != 40 {
+                        eprintln!("RTC backup must be exactly 40 bytes (got {}).", data.len());
+                        process::exit(1);
+                    }
+                    data
+                }
+                None => {
+                    if seconds > 59 || minutes > 59 || hours > 23 {
+                        eprintln!("Out-of-range time (max 23:59:59).");
+                        process::exit(1);
+                    }
+                    cartridge::RtcData {
+                        seconds,
+                        minutes,
+                        hours,
+                        days,
+                        halt: false,
+                        day_carry: false,
+                    }
+                    .to_payload()
+                }
+            };
+
+            eprintln!("Writing RTC...");
+            match device.write_rtc(info.rom_size, info.ram_size, &payload) {
+                Ok(()) => {
+                    eprintln!("RTC written.");
+                    // Read back to confirm it took (a dead battery won't persist it).
+                    if let Ok(rb) = device.read_rtc(info.rom_size, info.ram_size) {
+                        if let Some(rtc) = cartridge::RtcData::parse(&rb) {
+                            eprintln!("Read back: {rtc}");
+                            if !rtc.is_valid() {
+                                eprintln!(
+                                    "Note: read-back is out of range — a dead RTC battery \
+                                     won't hold the written values."
+                                );
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Error: {e}");
+                    process::exit(1);
+                }
+            }
+        }
+    }
+}
+
+/// Exit with a clear message unless the cartridge is a GB cart with an RTC.
+fn require_rtc(info: &CartridgeInfo) {
+    if info.cart_type != CartridgeType::GB {
+        eprintln!("RTC is only available on Game Boy cartridges.");
+        process::exit(1);
+    }
+    if !info.has_rtc() {
+        eprintln!("This cartridge has no real-time clock (MBC: {}).", info.mbc_name());
+        process::exit(1);
     }
 }

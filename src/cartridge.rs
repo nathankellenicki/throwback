@@ -154,6 +154,12 @@ impl CartridgeInfo {
         }
     }
 
+    /// Whether the GB cartridge has a real-time clock. Only MBC3 variants with the
+    /// Timer carry one: 0x0F (Timer+Battery) and 0x10 (Timer+RAM+Battery).
+    pub fn has_rtc(&self) -> bool {
+        matches!(self.mbc_type, 0x0F | 0x10)
+    }
+
     /// Format the header checksum with a validity verdict when we've been able to
     /// recompute it from the header bytes (GB/GBA).
     fn checksum_line(&self) -> String {
@@ -226,6 +232,9 @@ impl fmt::Display for CartridgeInfo {
                     writeln!(f, "Save:            {}", format_size(self.ram_size))?;
                 } else {
                     writeln!(f, "Save:            None")?;
+                }
+                if self.has_rtc() {
+                    writeln!(f, "RTC:             Present")?;
                 }
                 if let Some(region) = &self.region_label {
                     writeln!(f, "Region:          {region}")?;
@@ -373,6 +382,81 @@ pub fn snes_region_name(code: u8) -> &'static str {
         0x10 => "Brazil",
         0x11 => "Australia",
         _ => "Unknown",
+    }
+}
+
+/// Decoded MBC3 real-time clock. The registers track ELAPSED time since the clock
+/// was last set (a running day/hour/minute/second counter), not wall-clock time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RtcData {
+    pub seconds: u8,
+    pub minutes: u8,
+    pub hours: u8,
+    /// 9-bit day counter (day-low byte + bit 0 of the control register).
+    pub days: u16,
+    /// Control bit 6: clock halted.
+    pub halt: bool,
+    /// Control bit 7: day counter overflowed past 511.
+    pub day_carry: bool,
+}
+
+impl RtcData {
+    /// Parse the device's 40-byte ReadRTC payload. It holds 5 registers (seconds,
+    /// minutes, hours, day-low, day-control) as u32 little-endian, twice (current +
+    /// latched); we decode the current set (the first five). `None` if too short.
+    pub fn parse(payload: &[u8]) -> Option<Self> {
+        if payload.len() < 20 {
+            return None;
+        }
+        let reg = |i: usize| payload[i * 4]; // low byte of each u32-LE register
+        let dh = reg(4);
+        Some(RtcData {
+            seconds: reg(0),
+            minutes: reg(1),
+            hours: reg(2),
+            days: ((dh as u16 & 1) << 8) | reg(3) as u16,
+            halt: dh & 0x40 != 0,
+            day_carry: dh & 0x80 != 0,
+        })
+    }
+
+    /// Serialize back to the 40-byte payload (current + latched set to the same
+    /// values), suitable for WriteRTC.
+    pub fn to_payload(&self) -> Vec<u8> {
+        let dh = ((self.days >> 8) as u8 & 1)
+            | if self.halt { 0x40 } else { 0 }
+            | if self.day_carry { 0x80 } else { 0 };
+        let regs = [self.seconds, self.minutes, self.hours, self.days as u8, dh];
+        let mut out = Vec::with_capacity(40);
+        for _ in 0..2 {
+            for &r in &regs {
+                out.extend_from_slice(&(r as u32).to_le_bytes());
+            }
+        }
+        out
+    }
+
+    /// Whether the registers are within MBC3 valid ranges. Out-of-range values
+    /// (e.g. minutes > 59, hours > 23) indicate a dead/uninitialized RTC battery.
+    pub fn is_valid(&self) -> bool {
+        self.seconds <= 59 && self.minutes <= 59 && self.hours <= 23
+    }
+}
+
+impl fmt::Display for RtcData {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{} days, {:02}:{:02}:{:02}",
+            self.days, self.hours, self.minutes, self.seconds
+        )?;
+        if self.day_carry {
+            write!(f, " (day overflow)")?;
+        }
+        if self.halt {
+            write!(f, " (halted)")?;
+        }
+        Ok(())
     }
 }
 
