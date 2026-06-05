@@ -468,6 +468,70 @@ fn test_snes_coprocessor() {
 }
 
 #[test]
+fn test_camera_photo_slots() {
+    let mut save = vec![0u8; 0x20000];
+    save[0x11B2..0x11B2 + 4].copy_from_slice(&[0x00, 0x01, 0x02, 0xFF]);
+    assert_eq!(camera_photo_slots(&save), vec![0, 1, 2]);
+
+    // 0xFF at the start = no photos.
+    let mut empty = vec![0u8; 0x20000];
+    empty[0x11B2] = 0xFF;
+    assert!(camera_photo_slots(&empty).is_empty());
+
+    // Too short for a directory.
+    assert!(camera_photo_slots(&[0u8; 16]).is_empty());
+}
+
+#[test]
+fn test_decode_camera_photo() {
+    let mut save = vec![0u8; 0x20000];
+    let base = 0x2000; // slot 0
+    // Tile 0, row 0: both bitplanes set → pixel value 3 (darkest) across 8 px.
+    save[base] = 0xFF;
+    save[base + 1] = 0xFF;
+
+    let img = decode_camera_photo(&save, 0).unwrap();
+    assert_eq!(img.len(), CAMERA_PHOTO_WIDTH * CAMERA_PHOTO_HEIGHT);
+    // Top-left 8 px = value 3 → 0x00 (black); next pixel is value 0 → 0xFF (white).
+    for x in 0..8 {
+        assert_eq!(img[x], 0x00);
+    }
+    assert_eq!(img[8], 0xFF);
+
+    // Out-of-range slot.
+    assert!(decode_camera_photo(&save, 1000).is_none());
+}
+
+#[test]
+fn test_camera_frame_index() {
+    let mut save = vec![0u8; 0x20000];
+    save[0x2000 + 0xF54] = 5;
+    assert_eq!(camera_frame_index(&save, 0), 5);
+    save[0x2000 + 0xF54] = 0x99; // out of range → fallback 0
+    assert_eq!(camera_frame_index(&save, 0), 0);
+}
+
+#[test]
+fn test_decode_camera_photo_framed() {
+    let mut save = vec![0u8; 0x20000];
+    // Photo slot 0, tile 0 row 0 = value 3 (darkest) across 8 px.
+    save[0x2000] = 0xFF;
+    save[0x2001] = 0xFF;
+    save[0x2000 + 0xF54] = 0; // frame 0
+    // Frame 0 block (all zero → border tiles render as value 0 = white).
+    let rom = vec![0u8; 0xD0000 + 0x688];
+
+    let img = decode_camera_photo_framed(&save, &rom, 0).unwrap();
+    assert_eq!(img.len(), CAMERA_FRAME_WIDTH * CAMERA_FRAME_HEIGHT);
+    // Border corner (0,0): all-zero tile → value 0 → 0xFF.
+    assert_eq!(img[0], 0xFF);
+    // Photo composited at (16,16): its top-left pixel was value 3 → 0x00.
+    assert_eq!(img[16 * CAMERA_FRAME_WIDTH + 16], 0x00);
+    // Out-of-range slot.
+    assert!(decode_camera_photo_framed(&save, &rom, 1000).is_none());
+}
+
+#[test]
 fn test_flashcart_writeable() {
     // Flashcart: first result byte has bit 0 set (observed 0x21 + descriptors).
     assert!(flashcart_writeable(&[0x21, 0x15, 0x02, 0x01]));

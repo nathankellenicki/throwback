@@ -488,6 +488,148 @@ pub fn gba_header_checksum(rom: &[u8]) -> Option<u8> {
     Some(chk.wrapping_sub(0x19))
 }
 
+/// GB Camera (Pocket Camera) MBC type byte (header 0x0147).
+pub const MBC_POCKET_CAMERA: u8 = 0xFC;
+/// A decoded GB Camera photo is 128×112 px, 8-bit grayscale.
+pub const CAMERA_PHOTO_WIDTH: usize = 128;
+pub const CAMERA_PHOTO_HEIGHT: usize = 112;
+
+const CAM_DIR_OFFSET: usize = 0x11B2; // photo-order directory (30 bytes)
+const CAM_SLOT0_OFFSET: usize = 0x2000; // first photo slot
+const CAM_SLOT_SIZE: usize = 0x1000; // bytes per slot
+const CAM_IMAGE_TILES: usize = 224; // 16×14 tiles = 128×112 px
+/// 4-shade grayscale for GB 2bpp pixel values 0..=3 (0 = lightest, 3 = darkest).
+const CAM_SHADES: [u8; 4] = [0xFF, 0xA8, 0x54, 0x00];
+
+/// GB Camera photo order from the directory at 0x11B2: each entry is the slot
+/// (0x00..=0x1D) holding the next photo, terminated by 0xFF. Returns slot indices
+/// in display order (empty if the directory is absent/empty).
+pub fn camera_photo_slots(save: &[u8]) -> Vec<usize> {
+    let mut slots = Vec::new();
+    if save.len() < CAM_DIR_OFFSET + 30 {
+        return slots;
+    }
+    for &b in &save[CAM_DIR_OFFSET..CAM_DIR_OFFSET + 30] {
+        if b == 0xFF {
+            break;
+        }
+        if (b as usize) < 30 {
+            slots.push(b as usize);
+        }
+    }
+    slots
+}
+
+/// Decode one GB Camera photo slot to a 128×112 8-bit grayscale buffer (row-major).
+/// The image is 16×14 GB 2bpp tiles stored in reading order at the start of the
+/// 0x1000-byte slot. Returns `None` if the slot doesn't fit in `save`.
+pub fn decode_camera_photo(save: &[u8], slot: usize) -> Option<Vec<u8>> {
+    let base = CAM_SLOT0_OFFSET + slot * CAM_SLOT_SIZE;
+    if base + CAM_IMAGE_TILES * 16 > save.len() {
+        return None;
+    }
+    let tiles_w = CAMERA_PHOTO_WIDTH / 8; // 16
+    let mut out = vec![0u8; CAMERA_PHOTO_WIDTH * CAMERA_PHOTO_HEIGHT];
+    for t in 0..CAM_IMAGE_TILES {
+        let tile = &save[base + t * 16..base + t * 16 + 16];
+        let (tcol, trow) = (t % tiles_w, t / tiles_w);
+        for r in 0..8 {
+            let (lo, hi) = (tile[r * 2], tile[r * 2 + 1]);
+            for c in 0..8 {
+                let bit = 7 - c;
+                let v = (((hi >> bit) & 1) << 1 | ((lo >> bit) & 1)) as usize;
+                let x = tcol * 8 + c;
+                let y = trow * 8 + r;
+                out[y * CAMERA_PHOTO_WIDTH + x] = CAM_SHADES[v];
+            }
+        }
+    }
+    Some(out)
+}
+
+/// A framed GB Camera photo is the full 160×144 GB screen.
+pub const CAMERA_FRAME_WIDTH: usize = 160;
+pub const CAMERA_FRAME_HEIGHT: usize = 144;
+
+const CAM_FRAME_COUNT: usize = 18; // standard ROM (Hello Kitty has 25, not supported)
+const CAM_FRAME_BLOCK: usize = 0x688; // bytes per frame: 96 tiles (0x600) + 0x88 tilemap
+const CAM_FRAME_BANK0: usize = 0xD0000; // ROM offset, frames 0..=8
+const CAM_FRAME_BANK1: usize = 0xD4000; // ROM offset, frames 9..=17
+const CAM_FRAME_TILEMAP: usize = 0x600; // tilemap offset within a frame block
+const CAM_FRAME_IDX_OFFSET: usize = 0xF54; // frame index within a photo slot's metadata
+
+/// Read the frame/border index a photo was taken with (slot metadata, clamped to a
+/// valid standard-ROM frame; falls back to 0).
+pub fn camera_frame_index(save: &[u8], slot: usize) -> usize {
+    let off = CAM_SLOT0_OFFSET + slot * CAM_SLOT_SIZE + CAM_FRAME_IDX_OFFSET;
+    let idx = save.get(off).copied().unwrap_or(0) as usize;
+    if idx < CAM_FRAME_COUNT { idx } else { 0 }
+}
+
+fn cam_draw_tile(out: &mut [u8], stride: usize, block: &[u8], tile: usize, x0: usize, y0: usize) {
+    let toff = tile * 16;
+    if toff + 16 > block.len() {
+        return;
+    }
+    for r in 0..8 {
+        let (lo, hi) = (block[toff + r * 2], block[toff + r * 2 + 1]);
+        for c in 0..8 {
+            let bit = 7 - c;
+            let v = (((hi >> bit) & 1) << 1 | ((lo >> bit) & 1)) as usize;
+            out[(y0 + r) * stride + (x0 + c)] = CAM_SHADES[v];
+        }
+    }
+}
+
+/// Compose the full 160×144 framed view of a photo: the decorative border from the
+/// camera ROM (per the photo's stored frame index) with the 128×112 photo
+/// composited into the centre. `rom` is the camera cartridge ROM. Returns `None` if
+/// the photo slot or the frame block doesn't fit. Standard ROM only.
+///
+/// Frame block layout (verified vs hardware): tiles at 0x000 (96×16 B); tilemap at
+/// 0x600 split into top/bottom rows (`0x600 + xTile + 20*z`, z=0,1,2,3 → rows
+/// 0,1,16,17) and side strips (`0x650 + yTile*4 + z`, z → cols 0,1,18,19).
+pub fn decode_camera_photo_framed(save: &[u8], rom: &[u8], slot: usize) -> Option<Vec<u8>> {
+    let photo = decode_camera_photo(save, slot)?;
+    let frame = camera_frame_index(save, slot);
+    let base = if frame < 9 {
+        CAM_FRAME_BANK0 + frame * CAM_FRAME_BLOCK
+    } else {
+        CAM_FRAME_BANK1 + (frame - 9) * CAM_FRAME_BLOCK
+    };
+    let block = rom.get(base..base + CAM_FRAME_BLOCK)?;
+
+    let w = CAMERA_FRAME_WIDTH;
+    let mut out = vec![0u8; w * CAMERA_FRAME_HEIGHT];
+    let tm = CAM_FRAME_TILEMAP;
+
+    // Top/bottom border rows.
+    for xt in 0..20 {
+        for z in 0..4 {
+            let tile = block[tm + xt + 20 * z] as usize;
+            let x = xt * 8;
+            let y = (if z & 1 != 0 { 8 } else { 0 }) + (if z & 2 != 0 { 128 } else { 0 });
+            cam_draw_tile(&mut out, w, block, tile, x, y);
+        }
+    }
+    // Left/right border strips for the 14 middle rows.
+    for yt in 0..14 {
+        for z in 0..4 {
+            let tile = block[tm + 0x50 + yt * 4 + z] as usize;
+            let x = (if z & 1 != 0 { 8 } else { 0 }) + (if z & 2 != 0 { 144 } else { 0 });
+            let y = 16 + yt * 8;
+            cam_draw_tile(&mut out, w, block, tile, x, y);
+        }
+    }
+    // Composite the photo into the centre (offset 16,16).
+    for y in 0..CAMERA_PHOTO_HEIGHT {
+        for x in 0..CAMERA_PHOTO_WIDTH {
+            out[(16 + y) * w + (16 + x)] = photo[y * CAMERA_PHOTO_WIDTH + x];
+        }
+    }
+    Some(out)
+}
+
 /// Classify a DetectFlashcart (0x15) result: is the inserted cart a writeable
 /// flashcart? Observed on hardware — a flashcart returns bit 0 set in the first
 /// result byte (0x21) plus flash-chip descriptors; a retail mask-ROM cart returns

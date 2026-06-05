@@ -8,6 +8,7 @@ clap = { version = "4", features = ["derive"] }
 serialport = "4"
 crc = "3"
 thiserror = "2"
+png = "0.17"
 
 [dev-dependencies]
 sha2 = "0.10"

@@ -48,6 +48,20 @@ enum Commands {
         #[arg(long)]
         force: bool,
     },
+    /// Extract photos from a Game Boy Camera cartridge (or a camera .sav)
+    ReadCamera {
+        /// Output directory for the decoded PNGs
+        output: PathBuf,
+        /// Decode an existing camera save file instead of reading the cartridge
+        #[arg(long)]
+        from: Option<PathBuf>,
+        /// Render the on-device 160x144 view with each photo's decorative frame
+        #[arg(long)]
+        framed: bool,
+        /// Camera ROM file for --framed (with --from); otherwise read from the cart
+        #[arg(long)]
+        rom: Option<PathBuf>,
+    },
     /// Read the cartridge's real-time clock (MBC3 carts)
     ReadRtc {
         /// Optional file to save the raw 40-byte RTC payload as a backup
@@ -107,6 +121,22 @@ fn print_progress(label: &str, current: u32, total: u32) {
     if current >= total {
         eprintln!();
     }
+}
+
+/// Write an 8-bit grayscale buffer as a PNG.
+fn write_gray_png(
+    path: &std::path::Path,
+    width: u32,
+    height: u32,
+    pixels: &[u8],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let file = fs::File::create(path)?;
+    let buf = std::io::BufWriter::new(file);
+    let mut enc = png::Encoder::new(buf, width, height);
+    enc.set_color(png::ColorType::Grayscale);
+    enc.set_depth(png::BitDepth::Eight);
+    enc.write_header()?.write_image_data(pixels)?;
+    Ok(())
 }
 
 fn dump_rom_gb(device: &mut dyn CartridgeDevice, info: &CartridgeInfo, output: &PathBuf) {
@@ -597,6 +627,116 @@ fn main() {
                     process::exit(1);
                 }
             }
+        }
+
+        Commands::ReadCamera { output, from, framed, rom } => {
+            // Acquire the 128 KB SRAM (and, for --framed, the camera ROM) from
+            // either supplied files or the cartridge.
+            let (save, rom_data): (Vec<u8>, Option<Vec<u8>>) = match from {
+                Some(path) => {
+                    let save = fs::read(&path).unwrap_or_else(|e| {
+                        eprintln!("Error reading file: {e}");
+                        process::exit(1);
+                    });
+                    let rom_data = if framed {
+                        let rp = rom.unwrap_or_else(|| {
+                            eprintln!("--framed with --from also needs --rom <camera-rom-file>.");
+                            process::exit(1);
+                        });
+                        Some(fs::read(&rp).unwrap_or_else(|e| {
+                            eprintln!("Error reading ROM file: {e}");
+                            process::exit(1);
+                        }))
+                    } else {
+                        None
+                    };
+                    (save, rom_data)
+                }
+                None => {
+                    let mut device = open_device();
+                    let info = read_cart_info(device.as_mut());
+                    if info.mbc_type != cartridge::MBC_POCKET_CAMERA {
+                        eprintln!(
+                            "This is not a Game Boy Camera cartridge (MBC: {} 0x{:02X}).",
+                            info.mbc_name(),
+                            info.mbc_type
+                        );
+                        process::exit(1);
+                    }
+                    eprintln!("Reading Game Boy Camera SRAM ({})...", format_size(info.ram_size));
+                    let save = device
+                        .read_save(ChipType::Unknown, info.rom_size, info.ram_size, &|cur| {
+                            print_progress("Reading save", cur, info.ram_size)
+                        })
+                        .unwrap_or_else(|e| {
+                            eprintln!("\nError: {e}");
+                            process::exit(1);
+                        });
+                    let rom_data = if framed {
+                        match rom {
+                            Some(rp) => Some(fs::read(&rp).unwrap_or_else(|e| {
+                                eprintln!("Error reading ROM file: {e}");
+                                process::exit(1);
+                            })),
+                            None => {
+                                eprintln!("Reading Game Boy Camera ROM for frames ({})...", format_size(info.rom_size));
+                                Some(
+                                    device
+                                        .read_rom(ChipType::Unknown, info.rom_size, 0, &|cur| {
+                                            print_progress("Reading ROM", cur, info.rom_size)
+                                        })
+                                        .unwrap_or_else(|e| {
+                                            eprintln!("\nError: {e}");
+                                            process::exit(1);
+                                        }),
+                                )
+                            }
+                        }
+                    } else {
+                        None
+                    };
+                    (save, rom_data)
+                }
+            };
+
+            let slots = cartridge::camera_photo_slots(&save);
+            match slots.len() {
+                0 => {
+                    println!("Found no photos on your Game Boy Camera.");
+                    return;
+                }
+                1 => println!("Found 1 photo on your Game Boy Camera."),
+                n => println!("Found {n} photos on your Game Boy Camera."),
+            }
+
+            fs::create_dir_all(&output).unwrap_or_else(|e| {
+                eprintln!("Error creating output directory: {e}");
+                process::exit(1);
+            });
+
+            let (w, h) = if framed {
+                (cartridge::CAMERA_FRAME_WIDTH as u32, cartridge::CAMERA_FRAME_HEIGHT as u32)
+            } else {
+                (cartridge::CAMERA_PHOTO_WIDTH as u32, cartridge::CAMERA_PHOTO_HEIGHT as u32)
+            };
+
+            for (i, &slot) in slots.iter().enumerate() {
+                let pixels = if framed {
+                    cartridge::decode_camera_photo_framed(&save, rom_data.as_ref().unwrap(), slot)
+                } else {
+                    cartridge::decode_camera_photo(&save, slot)
+                };
+                let Some(pixels) = pixels else {
+                    eprintln!("Photo {} (slot {slot}) is out of range; skipping.", i + 1);
+                    continue;
+                };
+                let path = output.join(format!("photo_{:02}.png", i + 1));
+                if let Err(e) = write_gray_png(&path, w, h, &pixels) {
+                    eprintln!("Error writing {}: {e}", path.display());
+                    process::exit(1);
+                }
+            }
+            eprintln!("Saved {} photo(s) to {}", slots.len(), output.display());
         }
 
         Commands::ReadRtc { output } => {
