@@ -551,28 +551,48 @@ pub fn decode_camera_photo(save: &[u8], slot: usize) -> Option<Vec<u8>> {
 pub const CAMERA_FRAME_WIDTH: usize = 160;
 pub const CAMERA_FRAME_HEIGHT: usize = 144;
 
-const CAM_FRAME_COUNT: usize = 18; // standard ROM (Hello Kitty has 25, not supported)
-const CAM_FRAME_BLOCK: usize = 0x688; // bytes per frame: 96 tiles (0x600) + 0x88 tilemap
-const CAM_FRAME_BANK0: usize = 0xD0000; // ROM offset, frames 0..=8
-const CAM_FRAME_BANK1: usize = 0xD4000; // ROM offset, frames 9..=17
-const CAM_FRAME_TILEMAP: usize = 0x600; // tilemap offset within a frame block
+const CAM_FRAMES_STD: usize = 18; // standard ROM frame count
+const CAM_FRAMES_HK: usize = 25; // Hello Kitty Pocket Camera frame count
+const CAM_FRAME_BLOCK: usize = 0x688; // standard frame stride: 96 tiles (0x600) + 0x88 tilemap
+const CAM_FRAME_BANK0: usize = 0xD0000; // ROM offset, standard frames 0..=8
+const CAM_FRAME_BANK1: usize = 0xD4000; // ROM offset, standard frames 9..=17
+const CAM_FRAME_TILEMAP: usize = 0x600; // tilemap offset within a standard frame block
 const CAM_FRAME_IDX_OFFSET: usize = 0xF54; // frame index within a photo slot's metadata
 
-/// Read the frame/border index a photo was taken with (slot metadata, clamped to a
-/// valid standard-ROM frame; falls back to 0).
+/// Hello Kitty Pocket Camera frames: per-frame (tile-graphics offset, tilemap offset)
+/// in the ROM — they're not on a uniform stride like the standard ROM. Transcribed
+/// from jkbenaim/gbcamextract. UNTESTED (no HK cart available to verify).
+const HELLO_KITTY_FRAME_OFFSETS: [[usize; 2]; CAM_FRAMES_HK] = [
+    [0xC6C70, 0xCF5D0], [0xC3B80, 0xCF548], [0xCBEC0, 0xCF4C0], [0xC5F10, 0xCF658],
+    [0xCF210, 0xCF7F0], [0xC73A0, 0xCF768], [0xB7420, 0xCF6E0], [0xBE3E0, 0xCF438],
+    [0xB3CD0, 0xC7EF0], [0xB2B80, 0xCF3B0], [0x8FD50, 0xC7F78], [0xC3800, 0xD7800],
+    [0xBDC00, 0xD3F70], [0xD7F70, 0xD7888], [0xC5C00, 0xD7998], [0xB7C20, 0xD7910],
+    [0xC3ED0, 0xD3D50], [0x33F80, 0xD3CC8], [0xDB800, 0xD3DD8], [0xB2200, 0xD3EE8],
+    [0xB34D0, 0xD3E60], [0xB3030, 0xD7A20], [0x93E00, 0xD7D50], [0x77FE0, 0xCFCB8],
+    [0x77FF0, 0xCFDC4],
+];
+
+/// True if the ROM is a Hello Kitty Pocket Camera (title at 0x134 == "POCKETCAMERA_SN").
+pub fn camera_is_hello_kitty(rom: &[u8]) -> bool {
+    rom.len() >= 0x143 && &rom[0x134..0x143] == b"POCKETCAMERA_SN"
+}
+
+/// Read the frame/border index a photo was taken with (slot metadata). Clamped to a
+/// plausible range; the per-ROM validity check happens in decode_camera_photo_framed.
 pub fn camera_frame_index(save: &[u8], slot: usize) -> usize {
     let off = CAM_SLOT0_OFFSET + slot * CAM_SLOT_SIZE + CAM_FRAME_IDX_OFFSET;
     let idx = save.get(off).copied().unwrap_or(0) as usize;
-    if idx < CAM_FRAME_COUNT { idx } else { 0 }
+    if idx < CAM_FRAMES_HK { idx } else { 0 }
 }
 
-fn cam_draw_tile(out: &mut [u8], stride: usize, block: &[u8], tile: usize, x0: usize, y0: usize) {
-    let toff = tile * 16;
-    if toff + 16 > block.len() {
+/// Draw one 8×8 GB 2bpp tile from absolute ROM offset `tile_addr` into `out`.
+/// Bounds-checked: an out-of-range tile is silently skipped.
+fn cam_draw_tile(out: &mut [u8], stride: usize, rom: &[u8], tile_addr: usize, x0: usize, y0: usize) {
+    if tile_addr + 16 > rom.len() {
         return;
     }
     for r in 0..8 {
-        let (lo, hi) = (block[toff + r * 2], block[toff + r * 2 + 1]);
+        let (lo, hi) = (rom[tile_addr + r * 2], rom[tile_addr + r * 2 + 1]);
         for c in 0..8 {
             let bit = 7 - c;
             let v = (((hi >> bit) & 1) << 1 | ((lo >> bit) & 1)) as usize;
@@ -583,42 +603,58 @@ fn cam_draw_tile(out: &mut [u8], stride: usize, block: &[u8], tile: usize, x0: u
 
 /// Compose the full 160×144 framed view of a photo: the decorative border from the
 /// camera ROM (per the photo's stored frame index) with the 128×112 photo
-/// composited into the centre. `rom` is the camera cartridge ROM. Returns `None` if
-/// the photo slot or the frame block doesn't fit. Standard ROM only.
+/// composited into the centre. Supports the standard ROM and the Hello Kitty Pocket
+/// Camera. Returns `None` if the photo slot doesn't fit.
 ///
-/// Frame block layout (verified vs hardware): tiles at 0x000 (96×16 B); tilemap at
-/// 0x600 split into top/bottom rows (`0x600 + xTile + 20*z`, z=0,1,2,3 → rows
-/// 0,1,16,17) and side strips (`0x650 + yTile*4 + z`, z → cols 0,1,18,19).
+/// Frame layout (verified vs standard hardware): tiles at `tiles_base`; tilemap split
+/// into top/bottom rows (`tilemap_base + xTile + 20*z`, z=0,1,2,3 → rows 0,1,16,17)
+/// and side strips (`tilemap_base + 0x50 + yTile*4 + z`, z → cols 0,1,18,19). For the
+/// standard ROM tiles_base = 0xD0000 + f*0x688 and tilemap_base = tiles_base + 0x600;
+/// for Hello Kitty both come from HELLO_KITTY_FRAME_OFFSETS.
 pub fn decode_camera_photo_framed(save: &[u8], rom: &[u8], slot: usize) -> Option<Vec<u8>> {
     let photo = decode_camera_photo(save, slot)?;
-    let frame = camera_frame_index(save, slot);
-    let base = if frame < 9 {
-        CAM_FRAME_BANK0 + frame * CAM_FRAME_BLOCK
+
+    let hk = camera_is_hello_kitty(rom);
+    let frame_count = if hk { CAM_FRAMES_HK } else { CAM_FRAMES_STD };
+    // Out-of-range index → fall back to frame 0 (the default border). Only happens on
+    // corrupt/uninitialized metadata; a real saved photo stores a valid index.
+    // (gbcamextract falls back to 13 here instead; the difference is cosmetic.)
+    let mut frame = camera_frame_index(save, slot);
+    if frame >= frame_count {
+        frame = 0;
+    }
+
+    let (tiles_base, tilemap_base) = if hk {
+        (HELLO_KITTY_FRAME_OFFSETS[frame][0], HELLO_KITTY_FRAME_OFFSETS[frame][1])
     } else {
-        CAM_FRAME_BANK1 + (frame - 9) * CAM_FRAME_BLOCK
+        let g = if frame < 9 {
+            CAM_FRAME_BANK0 + frame * CAM_FRAME_BLOCK
+        } else {
+            CAM_FRAME_BANK1 + (frame - 9) * CAM_FRAME_BLOCK
+        };
+        (g, g + CAM_FRAME_TILEMAP)
     };
-    let block = rom.get(base..base + CAM_FRAME_BLOCK)?;
 
     let w = CAMERA_FRAME_WIDTH;
     let mut out = vec![0u8; w * CAMERA_FRAME_HEIGHT];
-    let tm = CAM_FRAME_TILEMAP;
+    let map = |i: usize| rom.get(tilemap_base + i).copied().unwrap_or(0) as usize;
 
-    // Top/bottom border rows.
+    // Top/bottom border rows (z=0,1,2,3 → rows 0,1,16,17).
     for xt in 0..20 {
         for z in 0..4 {
-            let tile = block[tm + xt + 20 * z] as usize;
+            let tile = map(xt + 20 * z);
             let x = xt * 8;
             let y = (if z & 1 != 0 { 8 } else { 0 }) + (if z & 2 != 0 { 128 } else { 0 });
-            cam_draw_tile(&mut out, w, block, tile, x, y);
+            cam_draw_tile(&mut out, w, rom, tiles_base + tile * 16, x, y);
         }
     }
-    // Left/right border strips for the 14 middle rows.
+    // Left/right border strips for the 14 middle rows (z → cols 0,1,18,19).
     for yt in 0..14 {
         for z in 0..4 {
-            let tile = block[tm + 0x50 + yt * 4 + z] as usize;
+            let tile = map(0x50 + yt * 4 + z);
             let x = (if z & 1 != 0 { 8 } else { 0 }) + (if z & 2 != 0 { 144 } else { 0 });
             let y = 16 + yt * 8;
-            cam_draw_tile(&mut out, w, block, tile, x, y);
+            cam_draw_tile(&mut out, w, rom, tiles_base + tile * 16, x, y);
         }
     }
     // Composite the photo into the centre (offset 16,16).
