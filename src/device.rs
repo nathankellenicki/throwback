@@ -85,9 +85,6 @@ pub fn build_command(command: u8, chip: ChipType, rom_size: u32, save_size: u32)
 /// Operations any Operator device exposes. Object-safe so the right implementation
 /// can be selected at runtime by device kind (`Box<dyn CartridgeDevice>`).
 pub trait CartridgeDevice {
-    /// Which device family this is (drives GB/GBA vs SNES handling in the CLI).
-    fn kind(&self) -> DeviceKind;
-
     /// Read the 64-byte cartridge signature packet.
     fn read_cartridge_info(&mut self) -> Result<[u8; 64], DeviceError>;
 
@@ -366,6 +363,71 @@ impl Serial {
         Ok(rom)
     }
 
+    /// Streaming-protocol save read (SN Operator). Mirrors `stream_game`: after the
+    /// 512-byte lead-in (READY frame + padding) the device pure-streams exactly
+    /// `save_size` SRAM bytes, then a `C0 DE 01 02` DONE frame + 512-byte trailer.
+    /// Verified against a Donkey Kong Country cartridge (HiROM, 2 KB SRAM): a
+    /// ReadSave request returned exactly 0x800 bytes framed by READY/DONE with no
+    /// ACKs. `rom_size` is still sent so the firmware can map the cart's SRAM.
+    fn stream_save(
+        &mut self,
+        chip: ChipType,
+        rom_size: u32,
+        save_size: u32,
+        progress: &dyn Fn(u32),
+    ) -> Result<Vec<u8>, DeviceError> {
+        self.flush_input();
+
+        let packet = build_command(CMD_READ_SAVE, chip, rom_size, save_size);
+        self.send(&packet)?;
+        self.drain(512)?; // READY frame + zero-padding lead-in
+
+        let target = save_size as usize;
+        let mut save = Vec::with_capacity(target);
+        let mut buf = [0u8; 4096];
+        while save.len() < target {
+            let want = (target - save.len()).min(buf.len());
+            self.port.read_exact(&mut buf[..want])?;
+            save.extend_from_slice(&buf[..want]);
+            progress(save.len() as u32);
+        }
+
+        let _ = self.drain(512); // trailing DONE frame + padding
+        Ok(save)
+    }
+
+    /// Streaming-protocol save write (SN Operator). Symmetric to `stream_save`:
+    /// send WriteSave, drain the device's 512-byte READY lead-in (`C0 DE 00 03`),
+    /// pure-stream the SRAM bytes (no per-chunk ACKs), then drain the 512-byte DONE
+    /// trailer (`C0 DE 01 03`). Verified against Donkey Kong Country with a SAFE
+    /// round-trip (write the just-read bytes back, re-read byte-identical).
+    fn stream_save_write(
+        &mut self,
+        chip: ChipType,
+        rom_size: u32,
+        data: &[u8],
+        progress: &dyn Fn(u32),
+    ) -> Result<(), DeviceError> {
+        self.flush_input();
+
+        let packet = build_command(CMD_WRITE_SAVE, chip, rom_size, data.len() as u32);
+        self.send(&packet)?;
+        self.drain(512)?; // READY frame + zero-padding lead-in
+
+        self.port.set_timeout(Duration::from_secs(20))?;
+        for (i, chunk) in data.chunks(4096).enumerate() {
+            self.port.write_all(chunk)?;
+            if i == 0 {
+                self.port.set_timeout(TIMEOUT)?;
+            }
+            progress((i * 4096 + chunk.len()) as u32);
+        }
+        self.port.flush()?;
+
+        let _ = self.drain(512); // trailing DONE frame + padding
+        Ok(())
+    }
+
     fn write_game(
         &mut self,
         data: &[u8],
@@ -452,10 +514,6 @@ impl LegacyDevice {
 }
 
 impl CartridgeDevice for LegacyDevice {
-    fn kind(&self) -> DeviceKind {
-        DeviceKind::GbOperator
-    }
-
     fn read_cartridge_info(&mut self) -> Result<[u8; 64], DeviceError> {
         self.io.read_signature()
     }
@@ -497,10 +555,6 @@ pub struct StreamingDevice {
 }
 
 impl CartridgeDevice for StreamingDevice {
-    fn kind(&self) -> DeviceKind {
-        DeviceKind::SnOperator
-    }
-
     fn read_cartridge_info(&mut self) -> Result<[u8; 64], DeviceError> {
         self.io.read_signature()
     }
@@ -517,11 +571,13 @@ impl CartridgeDevice for StreamingDevice {
     }
 
     fn read_save(&mut self, chip: ChipType, rom_size: u32, save_size: u32, progress: &dyn Fn(u32)) -> Result<Vec<u8>, DeviceError> {
-        self.io.read_save_data(chip, rom_size, save_size, progress)
+        // SNES saves pure-stream like ROM reads (no per-chunk ACKs); see stream_save.
+        self.io.stream_save(chip, rom_size, save_size, progress)
     }
 
     fn write_save(&mut self, chip: ChipType, rom_size: u32, data: &[u8], progress: &dyn Fn(u32)) -> Result<(), DeviceError> {
-        self.io.write_save_data(chip, rom_size, data, progress)
+        // SNES saves pure-stream like ROM reads (no per-chunk ACKs); see stream_save_write.
+        self.io.stream_save_write(chip, rom_size, data, progress)
     }
 
     fn write_rom(&mut self, data: &[u8], progress: &dyn Fn(u32), erase_progress: &dyn Fn(&str)) -> Result<(), DeviceError> {

@@ -3,7 +3,7 @@ mod device;
 
 use cartridge::{CartridgeInfo, CartridgeType, detect_eeprom_size, detect_gba_save, format_size, trim_gba_rom};
 use clap::{Parser, Subcommand};
-use device::{CartridgeDevice, ChipType, DeviceKind};
+use device::{CartridgeDevice, ChipType};
 use std::fs;
 use std::path::PathBuf;
 use std::process;
@@ -72,17 +72,6 @@ fn read_cart_info(device: &mut dyn CartridgeDevice) -> CartridgeInfo {
             process::exit(1);
         }
     }
-}
-
-/// SNES ROM/save transfers over the streaming protocol still need verification against
-/// a real cartridge (flow control + size detection — see notes/PROTOCOL.md). Until then,
-/// bail out clearly rather than sending an untested transfer.
-fn snes_not_ready(op: &str) -> ! {
-    eprintln!("SNES {op} is not yet verified against hardware.");
-    eprintln!("The SN Operator signature/info path works, but ROM/save transfer flow");
-    eprintln!("control still needs confirmation with a cartridge inserted.");
-    eprintln!("Tracked in notes/PROTOCOL.md (\"Open Questions\").");
-    process::exit(1);
 }
 
 fn print_progress(label: &str, current: u32, total: u32) {
@@ -265,9 +254,6 @@ fn main() {
 
         Commands::ReadSave { output } => {
             let mut device = open_device();
-            if device.kind() == DeviceKind::SnOperator {
-                snes_not_ready("save read");
-            }
             let info = read_cart_info(device.as_mut());
 
             match info.cart_type {
@@ -352,15 +338,52 @@ fn main() {
                         }
                     }
                 }
-                CartridgeType::SNES => snes_not_ready("save read"),
+                CartridgeType::SNES => {
+                    // The signature reports ROM size but not SRAM size, so read the
+                    // header and let parse_snes_header give us the save size + chip.
+                    let header = match device
+                        .read_header()
+                        .ok()
+                        .and_then(|buf| cartridge::parse_snes_header(&buf))
+                    {
+                        Some(h) => h,
+                        None => {
+                            eprintln!("Could not read the SNES cartridge header.");
+                            process::exit(1);
+                        }
+                    };
+
+                    if header.ram_size == 0 {
+                        eprintln!("This cartridge has no save RAM.");
+                        process::exit(1);
+                    }
+
+                    eprintln!("Reading save ({})...", format_size(header.ram_size));
+
+                    match device.read_save(
+                        header.save_chip,
+                        header.rom_size,
+                        header.ram_size,
+                        &|cur| print_progress("Reading", cur, header.ram_size),
+                    ) {
+                        Ok(save) => {
+                            fs::write(&output, &save).unwrap_or_else(|e| {
+                                eprintln!("Error writing file: {e}");
+                                process::exit(1);
+                            });
+                            eprintln!("Saved to {}", output.display());
+                        }
+                        Err(e) => {
+                            eprintln!("\nError: {e}");
+                            process::exit(1);
+                        }
+                    }
+                }
             }
         }
 
         Commands::WriteSave { input } => {
             let mut device = open_device();
-            if device.kind() == DeviceKind::SnOperator {
-                snes_not_ready("save write");
-            }
             let info = read_cart_info(device.as_mut());
 
             let data = fs::read(&input).unwrap_or_else(|e| {
@@ -438,7 +461,45 @@ fn main() {
                         }
                     }
                 }
-                CartridgeType::SNES => snes_not_ready("save write"),
+                CartridgeType::SNES => {
+                    // SRAM size comes from the header, not the signature.
+                    let header = match device
+                        .read_header()
+                        .ok()
+                        .and_then(|buf| cartridge::parse_snes_header(&buf))
+                    {
+                        Some(h) => h,
+                        None => {
+                            eprintln!("Could not read the SNES cartridge header.");
+                            process::exit(1);
+                        }
+                    };
+
+                    if header.ram_size == 0 {
+                        eprintln!("This cartridge has no save RAM.");
+                        process::exit(1);
+                    }
+
+                    if data.len() != header.ram_size as usize {
+                        eprintln!(
+                            "Warning: file size ({}) doesn't match cartridge SRAM size ({}).",
+                            format_size(data.len() as u32),
+                            format_size(header.ram_size)
+                        );
+                    }
+
+                    eprintln!("Writing save ({})...", format_size(data.len() as u32));
+
+                    match device.write_save(header.save_chip, header.rom_size, &data, &|cur| {
+                        print_progress("Writing", cur, data.len() as u32);
+                    }) {
+                        Ok(()) => eprintln!("Save written successfully."),
+                        Err(e) => {
+                            eprintln!("\nError: {e}");
+                            process::exit(1);
+                        }
+                    }
+                }
             }
         }
 
