@@ -127,9 +127,17 @@ pub trait CartridgeDevice {
     fn write_rom(
         &mut self,
         data: &[u8],
+        save_size: u32,
         progress: &dyn Fn(u32),
         erase_progress: &dyn Fn(&str),
     ) -> Result<(), DeviceError>;
+
+    /// Probe whether the inserted cart is a writeable flashcart (read-only, no
+    /// erase). Returns the raw FlashcartDetectionResult packet; decode with
+    /// `cartridge::flashcart_writeable`. Unsupported devices error.
+    fn detect_flashcart(&mut self) -> Result<[u8; 64], DeviceError> {
+        Err(DeviceError::Unsupported("flashcart detection not supported on this device"))
+    }
 
     /// Read the MBC3 real-time clock (40-byte payload: 5 registers, current +
     /// latched). Only meaningful on GB carts with an RTC; unsupported devices error.
@@ -351,6 +359,35 @@ impl Serial {
         Ok(())
     }
 
+    /// Probe the cart for flashcart detection (GB Operator). READ-ONLY — sends
+    /// DetectFlashcart (0x15) and returns the FlashcartDetectionResult packet. No
+    /// erase/write. Framing: READY `C0 DE 00 15`, 512-byte lead-in, result packet,
+    /// DONE `C0 DE 01 15`, trailer. Verified: a flashcart returns flash-chip
+    /// descriptors, a retail cart returns `0x20` + zeros.
+    fn detect_flashcart_result(&mut self) -> Result<[u8; 64], DeviceError> {
+        self.flush_input();
+        let packet = build_command(CMD_DETECT_FLASHCART, ChipType::Unknown, 0, 0);
+        self.send(&packet)?;
+        self.port.set_timeout(TIMEOUT)?;
+
+        // Skip the READY frame + lead-in zeros; the first non-framing, non-zero
+        // 64-byte packet is the result. Bounded so we never spin.
+        for _ in 0..32 {
+            let mut buf = [0u8; 64];
+            self.port.read_exact(&mut buf)?;
+            let is_frame = buf[0] == 0xC0 && buf[1] == 0xDE;
+            if is_frame && buf[2] == 0x01 {
+                break; // DONE frame before any result
+            }
+            if !is_frame && buf.iter().any(|&b| b != 0) {
+                let _ = self.read_until_timeout(); // drain trailer
+                return Ok(buf);
+            }
+        }
+        let _ = self.read_until_timeout();
+        Err(DeviceError::NoResponse)
+    }
+
     /// Read the MBC3 RTC (GB Operator). Framing matches the other reads: send
     /// ReadRTC, drain the 512-byte READY lead-in, read the 40-byte payload, drain
     /// the trailing padding + DONE frame. Verified on a Pokemon Crystal cartridge:
@@ -497,73 +534,71 @@ impl Serial {
         Ok(())
     }
 
+    /// Write a ROM to a flashcart (GB Operator). Reconstructed to match Playback's
+    /// byte-level transcript exactly (captured 2026-06-05 on a homebrew flashcart):
+    ///
+    /// 1. DetectFlashcart (required before WriteGame); drain its response.
+    /// 2. WriteGame — the device then ERASES the flash itself, streaming 64-byte
+    ///    `0xEE..` progress packets (~9 of them, ~500 ms apart) while the host only
+    ///    LISTENS. (`save_size` is sent so the firmware can size the operation.)
+    /// 3. CRITICAL TIMING: the instant erase ends (the first non-EE packet after the
+    ///    EE run), the device expects the ROM data IMMEDIATELY — if the host dawdles
+    ///    it times out and resets the USB (this was the long-standing bug). So we
+    ///    stream the ROM the moment erase completes, blind, in 64-byte packets with
+    ///    no reads/delays — exactly as Playback does (1024 back-to-back writes).
     fn write_game(
         &mut self,
         data: &[u8],
+        save_size: u32,
         progress: &dyn Fn(u32),
         erase_progress: &dyn Fn(&str),
     ) -> Result<(), DeviceError> {
         let rom_size = data.len() as u32;
+        self.flush_input();
 
-        // Flush stale data
-        self.read_until_timeout();
-
-        // Step 1: DetectFlashcart — required before WriteGame to prevent USB reset
+        // Step 1: DetectFlashcart, then drain its READY/result/DONE response.
         erase_progress("Preparing cartridge...");
-        let detect_packet = build_command(CMD_DETECT_FLASHCART, ChipType::Unknown, 0, 0);
-        self.send(&detect_packet)?;
-        self.port.set_timeout(Duration::from_secs(30))?;
+        let detect = build_command(CMD_DETECT_FLASHCART, ChipType::Unknown, 0, 0);
+        self.send(&detect)?;
+        self.port.set_timeout(Duration::from_millis(1500))?;
         let _ = self.read_until_timeout();
 
-        // Step 2: WriteGame command
+        // Step 2: WriteGame — device-driven erase, host listens for 0xEE packets.
         erase_progress("Erasing flash...");
-        let packet = build_command(CMD_WRITE_GAME, ChipType::Unknown, rom_size, 0);
+        let packet = build_command(CMD_WRITE_GAME, ChipType::Unknown, rom_size, save_size);
         self.send(&packet)?;
 
-        // Wait for erase — read EE progress packets
-        self.port.set_timeout(Duration::from_secs(10))?;
+        // Read 64-byte-aligned packets: skip the READY frame + lead-in zeros, count
+        // the 0xEE erase-progress packets, and break the instant a non-EE packet
+        // arrives after the erase run (the terminator) — then write WITHOUT delay.
+        self.port.set_timeout(Duration::from_secs(5))?;
         let mut seen_erase = false;
         loop {
             let mut buf = [0u8; 64];
-            match self.port.read(&mut buf) {
-                Ok(n) if n > 0 => {
-                    if buf[0] == 0xEE {
-                        seen_erase = true;
-                        erase_progress("Erasing...");
-                        continue;
-                    }
-                    if buf[0] == 0xC0 && buf[1] == 0xDE {
-                        if buf[2] == 0x01 && seen_erase { break; }
-                        continue;
-                    }
-                    if buf.iter().all(|&b| b == 0) {
-                        if seen_erase { break; }
-                        continue;
-                    }
-                }
-                Ok(_) => {
-                    if seen_erase { break; }
-                    continue;
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
-                    if seen_erase { break; }
-                    continue;
-                }
-                Err(_) => break,
+            self.port.read_exact(&mut buf)?;
+            if buf[0] == 0xEE {
+                seen_erase = true;
+                erase_progress("Erasing...");
+                continue;
             }
+            if seen_erase {
+                break; // first non-EE packet after the erase run = erase complete
+            }
+            // else: READY frame / lead-in zeros (before erase starts) — keep reading.
         }
 
-        // Step 3: Write data — straight 64-byte chunks, no ACKs
+        // Step 3: Stream the ROM immediately — blind 64-byte packets, no ACKs/reads.
         erase_progress("Writing...");
         self.port.set_timeout(TIMEOUT)?;
-
         for (i, chunk) in data.chunks(PACKET_SIZE).enumerate() {
             let mut buf = [0u8; PACKET_SIZE];
             buf[..chunk.len()].copy_from_slice(chunk);
             self.port.write_all(&buf)?;
             progress(((i + 1) * PACKET_SIZE).min(data.len()) as u32);
         }
+        self.port.flush()?;
 
+        let _ = self.drain(64); // best-effort: consume any trailing status packet
         Ok(())
     }
 }
@@ -607,8 +642,12 @@ impl CartridgeDevice for LegacyDevice {
         self.io.write_save_data(chip, rom_size, data, progress)
     }
 
-    fn write_rom(&mut self, data: &[u8], progress: &dyn Fn(u32), erase_progress: &dyn Fn(&str)) -> Result<(), DeviceError> {
-        self.io.write_game(data, progress, erase_progress)
+    fn write_rom(&mut self, data: &[u8], save_size: u32, progress: &dyn Fn(u32), erase_progress: &dyn Fn(&str)) -> Result<(), DeviceError> {
+        self.io.write_game(data, save_size, progress, erase_progress)
+    }
+
+    fn detect_flashcart(&mut self) -> Result<[u8; 64], DeviceError> {
+        self.io.detect_flashcart_result()
     }
 
     fn read_rtc(&mut self, rom_size: u32, save_size: u32) -> Result<Vec<u8>, DeviceError> {
@@ -657,7 +696,7 @@ impl CartridgeDevice for StreamingDevice {
         self.io.stream_save_write(chip, rom_size, data, progress)
     }
 
-    fn write_rom(&mut self, data: &[u8], progress: &dyn Fn(u32), erase_progress: &dyn Fn(&str)) -> Result<(), DeviceError> {
-        self.io.write_game(data, progress, erase_progress)
+    fn write_rom(&mut self, data: &[u8], save_size: u32, progress: &dyn Fn(u32), erase_progress: &dyn Fn(&str)) -> Result<(), DeviceError> {
+        self.io.write_game(data, save_size, progress, erase_progress)
     }
 }

@@ -468,6 +468,19 @@ fn test_snes_coprocessor() {
 }
 
 #[test]
+fn test_flashcart_writeable() {
+    // Flashcart: first result byte has bit 0 set (observed 0x21 + descriptors).
+    assert!(flashcart_writeable(&[0x21, 0x15, 0x02, 0x01]));
+    // Retail mask ROM: 0x20 then zeros.
+    assert!(!flashcart_writeable(&[0x20, 0, 0, 0]));
+    // Family marker | flashable bit holds across families.
+    assert!(flashcart_writeable(&[0x31]));
+    assert!(!flashcart_writeable(&[0x30]));
+    // Empty result.
+    assert!(!flashcart_writeable(&[]));
+}
+
+#[test]
 fn test_snes_region_name() {
     assert_eq!(snes_region_name(0x00), "Japan");
     assert_eq!(snes_region_name(0x01), "USA");

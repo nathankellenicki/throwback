@@ -488,6 +488,15 @@ pub fn gba_header_checksum(rom: &[u8]) -> Option<u8> {
     Some(chk.wrapping_sub(0x19))
 }
 
+/// Classify a DetectFlashcart (0x15) result: is the inserted cart a writeable
+/// flashcart? Observed on hardware — a flashcart returns bit 0 set in the first
+/// result byte (0x21) plus flash-chip descriptors; a retail mask-ROM cart returns
+/// 0x20 followed by all zeros. The high nibble mirrors the family marker, bit 0 =
+/// flashable. Returns false for an empty/short result.
+pub fn flashcart_writeable(detect: &[u8]) -> bool {
+    detect.first().is_some_and(|b| b & 0x01 != 0)
+}
+
 /// Decode the SNES coprocessor from the cart-type byte (header 0x16) and, for the
 /// Custom family, the chipset subtype byte (header base - 1, i.e. 0xFFBF/0x7FBF).
 /// Returns `None` when the low nibble shows no coprocessor present. Family per the

@@ -273,6 +273,15 @@ fn main() {
                     println!("{info}");
                 }
             }
+
+            // Read-only flashcart probe: is this a writeable flashcart or a retail cart?
+            if let Ok(detect) = device.detect_flashcart() {
+                if cartridge::flashcart_writeable(&detect) {
+                    println!("Writeable:       Yes (flashcart)");
+                } else {
+                    println!("Writeable:       No (retail/mask ROM)");
+                }
+            }
         }
 
         Commands::DumpRom { output } => {
@@ -539,6 +548,9 @@ fn main() {
 
         Commands::WriteRom { input } => {
             let mut device = open_device();
+            // The save size is part of the WriteGame command (Playback sends it), so
+            // read the cartridge signature first to learn it.
+            let info = read_cart_info(device.as_mut());
 
             let data = fs::read(&input).unwrap_or_else(|e| {
                 eprintln!("Error reading file: {e}");
@@ -553,7 +565,7 @@ fn main() {
 
             eprintln!("Writing {} to flash cart...", format_size(padded.len() as u32));
 
-            match device.write_rom(&padded, &|cur| {
+            match device.write_rom(&padded, info.ram_size, &|cur| {
                 print_progress("Writing", cur, padded.len() as u32);
             }, &|msg| {
                 eprintln!("\r{}    ", msg);
