@@ -44,6 +44,9 @@ enum Commands {
     WriteRom {
         /// Input file path
         input: PathBuf,
+        /// Write even if the cartridge isn't detected as a writeable flashcart
+        #[arg(long)]
+        force: bool,
     },
     /// Read the cartridge's real-time clock (MBC3 carts)
     ReadRtc {
@@ -546,11 +549,27 @@ fn main() {
             }
         }
 
-        Commands::WriteRom { input } => {
+        Commands::WriteRom { input, force } => {
             let mut device = open_device();
             // The save size is part of the WriteGame command (Playback sends it), so
             // read the cartridge signature first to learn it.
             let info = read_cart_info(device.as_mut());
+
+            // Safety guard: WriteGame erases the cart. A retail mask-ROM cart can't be
+            // flashed, so refuse unless --force. (DetectFlashcart is read-only.)
+            if !force {
+                match device.detect_flashcart() {
+                    Ok(d) if !cartridge::flashcart_writeable(&d) => {
+                        eprintln!(
+                            "Refusing to write: this cartridge is not a writeable flashcart \
+                             (retail / mask ROM)."
+                        );
+                        eprintln!("Flashing it would fail and could corrupt the cart. Pass --force to override.");
+                        process::exit(1);
+                    }
+                    _ => {} // writeable flashcart, or detection unsupported (e.g. SN Operator)
+                }
+            }
 
             let data = fs::read(&input).unwrap_or_else(|e| {
                 eprintln!("Error reading file: {e}");
