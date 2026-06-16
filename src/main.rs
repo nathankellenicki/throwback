@@ -218,7 +218,21 @@ fn dump_rom_snes(device: &mut dyn CartridgeDevice, info: &CartridgeInfo, output:
         ),
     }
 
-    fs::write(output, &rom).unwrap_or_else(|e| {
+    // The signature rounds non-power-of-2 carts up to the next power of two, so the
+    // read is padded with an open-bus/mirror tail. Trim it back to the real size.
+    let trimmed = cartridge::trim_snes_rom(&rom);
+    let out = if trimmed < rom.len() {
+        eprintln!(
+            "Trimmed non-power-of-2 ROM: {} -> {} (dropped over-read tail)",
+            format_size(rom.len() as u32),
+            format_size(trimmed as u32)
+        );
+        &rom[..trimmed]
+    } else {
+        &rom[..]
+    };
+
+    fs::write(output, out).unwrap_or_else(|e| {
         eprintln!("Error writing file: {e}");
         process::exit(1);
     });

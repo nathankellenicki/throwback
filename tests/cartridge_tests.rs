@@ -532,6 +532,29 @@ fn test_decode_camera_photo_framed() {
 }
 
 #[test]
+fn test_trim_snes_rom() {
+    // 4 MB over-read of a 2.5 MB cart: [0:2.5M] real, [2.5M:3M] mirror of [2M:2.5M],
+    // [3M:4M] open bus. High-entropy pattern that varies with the upper address bits
+    // so a 0.5 MB region isn't accidentally an internal mirror.
+    let mut rom = vec![0u8; 0x400000];
+    for i in 0..0x280000 {
+        rom[i] = (i ^ (i >> 7) ^ (i >> 15)) as u8;
+    }
+    rom.copy_within(0x200000..0x280000, 0x280000); // mirror the 0.5 MB chunk
+    for b in &mut rom[0x300000..0x400000] {
+        *b = 0x0B; // open bus
+    }
+    assert_eq!(trim_snes_rom(&rom), 0x280000);
+
+    // A clean power-of-2 ROM is returned unchanged.
+    let mut po2 = vec![0u8; 0x100000];
+    for i in 0..po2.len() {
+        po2[i] = (i ^ (i >> 7) ^ (i >> 15)) as u8;
+    }
+    assert_eq!(trim_snes_rom(&po2), 0x100000);
+}
+
+#[test]
 fn test_flashcart_writeable() {
     // Flashcart: first result byte has bit 0 set (observed 0x21 + descriptors).
     assert!(flashcart_writeable(&[0x21, 0x15, 0x02, 0x01]));

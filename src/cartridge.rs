@@ -1010,9 +1010,68 @@ pub fn parse_snes_header(rom: &[u8]) -> Option<SnesHeader> {
     })
 }
 
+/// Detect the real size of a SNES ROM from a power-of-2 over-read, returning the
+/// trimmed length. The SN Operator masks ReadGame to the power-of-2 rounded-up size,
+/// so a non-power-of-2 cart (e.g. 20 Mbit = 2.5 MB) comes back padded with an
+/// open-bus region and/or a mirror of the final chunk. Two passes:
+///   1. strip trailing 64 KB units that are open bus (an unconnected read returns
+///      only a couple of distinct byte values);
+///   2. while the bytes beyond the largest power of two are an internal mirror (the
+///      two halves of that remainder are equal), halve the remainder.
+/// Verified against Playback's own 2.5 MB output for Street Fighter II Turbo (Europe).
+/// (NOTE: that specific cart's bytes don't match No-Intro — the SN Operator reads its
+/// non-po2 mapping non-canonically, and Playback gets the identical bytes — but the
+/// trimmed SIZE is correct.)
+pub fn trim_snes_rom(rom: &[u8]) -> usize {
+    const UNIT: usize = 0x10000; // 64 KB
+    let mut n = rom.len();
+
+    // (1) Strip trailing open-bus units (≤ 16 distinct byte values).
+    while n > UNIT {
+        let unit = &rom[n - UNIT..n];
+        let mut seen = [false; 256];
+        let mut distinct = 0usize;
+        for &b in unit {
+            if !seen[b as usize] {
+                seen[b as usize] = true;
+                distinct += 1;
+                if distinct > 16 {
+                    break;
+                }
+            }
+        }
+        if distinct <= 16 {
+            n -= UNIT;
+        } else {
+            break;
+        }
+    }
+
+    // (2) Strip a trailing mirror of the remainder beyond the largest power of two.
+    loop {
+        let mut p = 1usize;
+        while p * 2 <= n {
+            p *= 2;
+        }
+        if p == n {
+            break; // power of two — nothing to trim
+        }
+        let rem = n - p;
+        if rem % 2 == 0 && rom[p..p + rem / 2] == rom[p + rem / 2..n] {
+            n = p + rem / 2;
+        } else {
+            break;
+        }
+    }
+    n
+}
+
 pub fn format_size(bytes: u32) -> String {
     if bytes >= 1024 * 1024 {
-        format!("{} MB", bytes / (1024 * 1024))
+        // Show up to 2 decimals for non-power-of-2 sizes (e.g. 2.5 MB), trimmed.
+        let s = format!("{:.2}", bytes as f64 / (1024.0 * 1024.0));
+        let s = s.trim_end_matches('0').trim_end_matches('.');
+        format!("{s} MB")
     } else if bytes >= 1024 {
         format!("{} KB", bytes / 1024)
     } else {
