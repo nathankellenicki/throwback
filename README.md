@@ -1,6 +1,6 @@
 # throwback
 
-A CLI for reading and writing game cartridges with Epilogue's GB Operator and SN Operator.
+A CLI for working with Epilogue's GB Operator and SN Operator.
 
 It dumps ROMs, backs up and restores saves, reads and sets the real-time clock on Pokémon carts, pulls the photos off a Game Boy Camera, and writes ROMs to flash carts.
 
