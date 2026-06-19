@@ -1,4 +1,4 @@
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
 use std::fs;
 use std::path::PathBuf;
 use std::process;
@@ -12,10 +12,22 @@ use throwback::patch::{self, Patch};
 const GBA_MAX_ROM: u32 = 32 * 1024 * 1024; // 32 MB
 
 #[derive(Parser)]
-#[command(name = "throwback", about = "CLI for the Epilogue GB/SN Operator")]
+#[command(
+    name = "throwback",
+    version,
+    // We print `--version` ourselves (just the bare number); clap's built-in
+    // flag would prefix the binary name.
+    disable_version_flag = true,
+    about = "CLI for the Epilogue GB/SN Operator",
+    // Put the version on the second line, just under the intro.
+    help_template = "{about-with-newline}Throwback {version}\n\n{usage-heading} {usage}\n\n{all-args}{after-help}"
+)]
 struct Cli {
+    /// Print version
+    #[arg(short = 'V', long)]
+    version: bool,
     #[command(subcommand)]
-    command: Commands,
+    command: Option<Commands>,
 }
 
 #[derive(Subcommand)]
@@ -330,7 +342,19 @@ fn dump_rom_snes(device: &mut dyn CartridgeDevice, info: &CartridgeInfo, output:
 fn main() {
     let cli = Cli::parse();
 
-    match cli.command {
+    if cli.version {
+        println!("{}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
+
+    // No subcommand: show the help (with the version line) and exit, matching
+    // clap's behaviour for a missing required subcommand.
+    let Some(command) = cli.command else {
+        let _ = Cli::command().print_help();
+        process::exit(2);
+    };
+
+    match command {
         Commands::Info { raw } => {
             let mut device = open_device();
             let data = match device.read_cartridge_info() {
