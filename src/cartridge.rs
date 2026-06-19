@@ -13,7 +13,6 @@ pub enum CartridgeType {
 
 /// Signature byte[2] cartridge-family markers reported by the Operator firmware.
 const SIG_MARKER_GB: u8 = 0x20;
-const SIG_MARKER_GBA: u8 = 0x30;
 const SIG_MARKER_SNES: u8 = 0x50;
 /// Offset in the SN Operator signature of the SNES ROM-size code (verified against
 /// a Desert Strike cartridge: signature[0x10] == header rom_size code 0x0A == 1 MB).
@@ -65,8 +64,8 @@ impl CartridgeInfo {
         let cart_type = match data[2] {
             SIG_MARKER_GB => CartridgeType::GB,
             SIG_MARKER_SNES => CartridgeType::SNES,
-            // GBA reports 0x30; treat any other present marker as GBA.
-            SIG_MARKER_GBA | _ => CartridgeType::GBA,
+            // GBA reports 0x30; treat any other present marker as GBA too.
+            _ => CartridgeType::GBA,
         };
 
         let title_char = data[0x0D] as char;
@@ -723,9 +722,7 @@ pub fn detect_gba_save(rom: &[u8]) -> (ChipType, u32) {
         (ChipType::Eeprom, 8 * 1024)
     } else if find_bytes(rom, b"FLASH1M_V").is_some() {
         (ChipType::Flash, 128 * 1024)
-    } else if find_bytes(rom, b"FLASH512_V").is_some() {
-        (ChipType::Flash, 64 * 1024)
-    } else if find_bytes(rom, b"FLASH_V").is_some() {
+    } else if find_bytes(rom, b"FLASH512_V").is_some() || find_bytes(rom, b"FLASH_V").is_some() {
         (ChipType::Flash, 64 * 1024)
     } else if find_bytes(rom, b"SRAM_V").is_some() || find_bytes(rom, b"SRAM_F_V").is_some() {
         (ChipType::Sram, 32 * 1024)
@@ -769,7 +766,7 @@ fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 /// real ROM data ends.
 pub fn trim_gba_rom(rom: &[u8]) -> usize {
     let sizes: &[usize] = &[
-        1 * 1024 * 1024,
+        1024 * 1024,
         2 * 1024 * 1024,
         4 * 1024 * 1024,
         8 * 1024 * 1024,
@@ -1018,6 +1015,7 @@ pub fn parse_snes_header(rom: &[u8]) -> Option<SnesHeader> {
 ///      only a couple of distinct byte values);
 ///   2. while the bytes beyond the largest power of two are an internal mirror (the
 ///      two halves of that remainder are equal), halve the remainder.
+///
 /// Verified against Playback's own 2.5 MB output for Street Fighter II Turbo (Europe).
 /// (NOTE: that specific cart's bytes don't match No-Intro — the SN Operator reads its
 /// non-po2 mapping non-canonically, and Playback gets the identical bytes — but the
@@ -1057,7 +1055,7 @@ pub fn trim_snes_rom(rom: &[u8]) -> usize {
             break; // power of two — nothing to trim
         }
         let rem = n - p;
-        if rem % 2 == 0 && rom[p..p + rem / 2] == rom[p + rem / 2..n] {
+        if rem.is_multiple_of(2) && rom[p..p + rem / 2] == rom[p + rem / 2..n] {
             n = p + rem / 2;
         } else {
             break;

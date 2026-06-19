@@ -493,8 +493,8 @@ fn test_decode_camera_photo() {
     let img = decode_camera_photo(&save, 0).unwrap();
     assert_eq!(img.len(), CAMERA_PHOTO_WIDTH * CAMERA_PHOTO_HEIGHT);
     // Top-left 8 px = value 3 → 0x00 (black); next pixel is value 0 → 0xFF (white).
-    for x in 0..8 {
-        assert_eq!(img[x], 0x00);
+    for &px in &img[..8] {
+        assert_eq!(px, 0x00);
     }
     assert_eq!(img[8], 0xFF);
 
@@ -537,8 +537,8 @@ fn test_trim_snes_rom() {
     // [3M:4M] open bus. High-entropy pattern that varies with the upper address bits
     // so a 0.5 MB region isn't accidentally an internal mirror.
     let mut rom = vec![0u8; 0x400000];
-    for i in 0..0x280000 {
-        rom[i] = (i ^ (i >> 7) ^ (i >> 15)) as u8;
+    for (i, b) in rom[..0x280000].iter_mut().enumerate() {
+        *b = (i ^ (i >> 7) ^ (i >> 15)) as u8;
     }
     rom.copy_within(0x200000..0x280000, 0x280000); // mirror the 0.5 MB chunk
     for b in &mut rom[0x300000..0x400000] {
@@ -548,8 +548,8 @@ fn test_trim_snes_rom() {
 
     // A clean power-of-2 ROM is returned unchanged.
     let mut po2 = vec![0u8; 0x100000];
-    for i in 0..po2.len() {
-        po2[i] = (i ^ (i >> 7) ^ (i >> 15)) as u8;
+    for (i, b) in po2.iter_mut().enumerate() {
+        *b = (i ^ (i >> 7) ^ (i >> 15)) as u8;
     }
     assert_eq!(trim_snes_rom(&po2), 0x100000);
 }

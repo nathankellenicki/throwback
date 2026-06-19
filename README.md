@@ -126,6 +126,16 @@ throwback write-rom homebrew.gbc
 
 This erases the cart and writes the new ROM, so it only makes sense on a flashable cart. throwback checks the cartridge first and refuses to touch a retail game. If you have a reason to write anyway, pass `--force`. The ROM is padded and aligned for you, so hand it the file as-is.
 
+### apply-patch
+
+Apply an IPS patch to a ROM file. This is useful for homebrew updates or ROM hacks before writing them to a flash cart.
+
+```
+throwback apply-patch homebrew.gbc update.ips -o homebrew_patched.gbc
+```
+
+The patched ROM is validated against its header checksum for Game Boy / Game Boy Color and Game Boy Advance ROMs. If validation fails, the output is not written unless you pass `--ignore-checksum`.
+
 ## Worth knowing
 
 - Clean the contacts. A dirty cartridge reads back corrupt data, and `info` can report an empty slot even with a cart inserted.

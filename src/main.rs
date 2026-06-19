@@ -1,12 +1,13 @@
-mod cartridge;
-mod device;
-
-use cartridge::{CartridgeInfo, CartridgeType, detect_eeprom_size, detect_gba_save, format_size, trim_gba_rom};
 use clap::{Parser, Subcommand};
-use device::{CartridgeDevice, ChipType};
 use std::fs;
 use std::path::PathBuf;
 use std::process;
+use throwback::cartridge::{
+    self, CartridgeInfo, CartridgeType, detect_eeprom_size, detect_gba_save, format_size,
+    trim_gba_rom,
+};
+use throwback::device::{self, CartridgeDevice, ChipType};
+use throwback::patch::{self, IpsPatch};
 
 const GBA_MAX_ROM: u32 = 32 * 1024 * 1024; // 32 MB
 
@@ -47,6 +48,19 @@ enum Commands {
         /// Write even if the cartridge isn't detected as a writeable flashcart
         #[arg(long)]
         force: bool,
+    },
+    /// Apply an IPS patch to a ROM file
+    ApplyPatch {
+        /// Source ROM file
+        rom: PathBuf,
+        /// IPS patch file
+        patch: PathBuf,
+        /// Output patched ROM file
+        #[arg(short, long)]
+        output: PathBuf,
+        /// Write even if the patched ROM fails header-checksum validation
+        #[arg(long)]
+        ignore_checksum: bool,
     },
     /// Extract photos from a Game Boy Camera cartridge (or a camera .sav)
     ReadCamera {
@@ -120,6 +134,65 @@ fn print_progress(label: &str, current: u32, total: u32) {
     );
     if current >= total {
         eprintln!();
+    }
+}
+
+fn apply_patch(rom_path: &PathBuf, patch_path: &PathBuf, output: &PathBuf, ignore_checksum: bool) {
+    let rom = fs::read(rom_path).unwrap_or_else(|e| {
+        eprintln!("Error reading ROM: {e}");
+        process::exit(1);
+    });
+
+    let patch_data = fs::read(patch_path).unwrap_or_else(|e| {
+        eprintln!("Error reading patch: {e}");
+        process::exit(1);
+    });
+
+    let patch = IpsPatch::load(&patch_data).unwrap_or_else(|e| {
+        eprintln!("Error parsing patch: {e}");
+        process::exit(1);
+    });
+
+    let original_len = rom.len();
+    let patched = patch.apply_into(rom);
+
+    // An empty result (e.g. a truncate-to-0 patch) is never a usable ROM, so
+    // refuse it regardless of --ignore-checksum.
+    if patched.is_empty() {
+        eprintln!("Patch produced an empty ROM; refusing to write.");
+        process::exit(1);
+    }
+
+    if !ignore_checksum {
+        match patch::validate_patched_rom(&patched) {
+            patch::Validation::Ok => eprintln!("Header checksum OK."),
+            patch::Validation::Skipped(reason) => {
+                eprintln!("Skipping header-checksum validation: {reason}.");
+            }
+            patch::Validation::Mismatch(e) => {
+                eprintln!("Validation failed: {e}");
+                eprintln!("The patch may be for a different ROM or the result may be corrupt.");
+                eprintln!("Pass --ignore-checksum to write it anyway.");
+                process::exit(1);
+            }
+        }
+    }
+
+    fs::write(output, &patched).unwrap_or_else(|e| {
+        eprintln!("Error writing output: {e}");
+        process::exit(1);
+    });
+
+    eprintln!("Applied {} to {}", patch_path.display(), rom_path.display());
+    eprintln!(
+        "Wrote {} ({} -> {} bytes)",
+        output.display(),
+        format_size(original_len as u32),
+        format_size(patched.len() as u32)
+    );
+
+    if ignore_checksum {
+        eprintln!("Warning: skipped header-checksum validation.");
     }
 }
 
@@ -643,6 +716,10 @@ fn main() {
             }
         }
 
+        Commands::ApplyPatch { rom, patch, output, ignore_checksum } => {
+            apply_patch(&rom, &patch, &output, ignore_checksum);
+        }
+
         Commands::ReadCamera { output, from, framed, rom } => {
             // Acquire the 128 KB SRAM (and, for --framed, the camera ROM) from
             // either supplied files or the cartridge.
@@ -826,8 +903,8 @@ fn main() {
                 Ok(()) => {
                     eprintln!("RTC written.");
                     // Read back to confirm it took (a dead battery won't persist it).
-                    if let Ok(rb) = device.read_rtc(info.rom_size, info.ram_size) {
-                        if let Some(rtc) = cartridge::RtcData::parse(&rb) {
+                    if let Ok(rb) = device.read_rtc(info.rom_size, info.ram_size)
+                        && let Some(rtc) = cartridge::RtcData::parse(&rb) {
                             eprintln!("Read back: {rtc}");
                             if !rtc.is_valid() {
                                 eprintln!(
@@ -836,7 +913,6 @@ fn main() {
                                 );
                             }
                         }
-                    }
                 }
                 Err(e) => {
                     eprintln!("Error: {e}");
