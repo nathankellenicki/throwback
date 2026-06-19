@@ -942,6 +942,17 @@ fn snes_header_score(rom: &[u8], base: usize, expect_map_hi_bit: u8) -> Option<u
     Some(score)
 }
 
+/// Decode a SNES header size code to bytes (`size = 2^code KB`, i.e. `1024 << code`).
+///
+/// The score gate in `parse_snes_header` can admit a header (on a valid checksum +
+/// printable title) whose size byte is garbage, and `1024u32 << code` overflows —
+/// panicking in debug, silently wrapping in release — once `code` is large. Real
+/// SNES carts top out at code 0x10 (64 Mbit), so anything above that is treated as
+/// unknown (0) rather than trusted.
+fn snes_size_from_code(code: u8) -> u32 {
+    if code > 0x10 { 0 } else { 1024u32 << code }
+}
+
 /// Parse the internal header of a dumped SNES ROM, detecting the mapper and reading
 /// ROM/save sizes. Returns `None` if no plausible header is found.
 ///
@@ -971,11 +982,10 @@ pub fn parse_snes_header(rom: &[u8]) -> Option<SnesHeader> {
 
     let title = String::from_utf8_lossy(&h[SNES_HDR_TITLE..SNES_HDR_TITLE + 21]).into_owned();
 
-    let rom_code = h[SNES_HDR_ROM_SIZE];
-    let rom_size = 1024u32 << rom_code;
+    let rom_size = snes_size_from_code(h[SNES_HDR_ROM_SIZE]);
 
     let ram_code = h[SNES_HDR_RAM_SIZE];
-    let ram_size = if ram_code == 0 { 0 } else { 1024u32 << ram_code };
+    let ram_size = if ram_code == 0 { 0 } else { snes_size_from_code(ram_code) };
 
     // SNES battery saves are SRAM. The cart-type byte's low nibble distinguishes
     // ROM (0) / ROM+RAM (1) / ROM+RAM+battery (2); coprocessor carts use the high

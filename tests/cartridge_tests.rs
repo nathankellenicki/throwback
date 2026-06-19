@@ -263,6 +263,20 @@ fn test_parse_snes_header_garbage() {
     assert!(parse_snes_header(&rom).is_none());
 }
 
+#[test]
+fn test_parse_snes_header_out_of_range_size_codes_dont_panic() {
+    // A header can pass the score gate on a valid checksum + printable title alone,
+    // so a garbage size byte reaches the size decode. It must yield 0 (unknown), not
+    // panic/wrap on `1024 << code`.
+    let rom = build_snes_rom(256 * 1024, 0x7FC0, "OVERFLOW", 0x20, 0x02, 0x08, 0xFF);
+    let h = parse_snes_header(&rom).expect("header still parses");
+    assert_eq!(h.ram_size, 0, "out-of-range ram_code should decode to 0");
+
+    let rom = build_snes_rom(256 * 1024, 0x7FC0, "OVERFLOW", 0x20, 0x02, 0xFF, 0x00);
+    let h = parse_snes_header(&rom).expect("header still parses");
+    assert_eq!(h.rom_size, 0, "out-of-range rom_code should decode to 0");
+}
+
 /// Real SN Operator signature captured from a Desert Strike cartridge (LoROM, 1 MB,
 /// no save). Locks in the signature→size decode that drives the SNES dump.
 fn desert_strike_signature() -> [u8; 64] {

@@ -15,7 +15,7 @@ Plug the Operator into USB and insert a cartridge. throwback finds the device on
 
 ## Building
 
-throwback is written in Rust. It uses the 2024 edition, so you need Rust 1.85 or newer.
+throwback is written in Rust. Rust 1.85 or newer required.
 
 ```
 cargo build --release
@@ -134,7 +134,7 @@ Apply an IPS patch to a ROM file. This is useful for homebrew updates or ROM hac
 throwback apply-patch homebrew.gbc update.ips -o homebrew_patched.gbc
 ```
 
-The patched ROM is validated against its header checksum for Game Boy / Game Boy Color and Game Boy Advance ROMs. If validation fails, the output is not written unless you pass `--ignore-checksum`.
+The patched ROM is validated against its header checksum for Game Boy / Game Boy Color and Game Boy Advance ROMs. If validation fails, the output is not written unless you pass `--ignore-checksum`. A ROM in another format (SNES, for example) has no header checksum throwback can verify, so it's written without that check.
 
 ## Worth knowing
 
