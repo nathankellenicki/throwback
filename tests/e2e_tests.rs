@@ -3,8 +3,8 @@
 //! Operator + Desert Strike (Europe).
 //! Run with: cargo test --test e2e_tests -- --ignored
 
-use flashback::cartridge::{parse_snes_header, CartridgeInfo, CartridgeType, SnesMapper};
-use flashback::device::{CartridgeDevice, ChipType, LegacyDevice};
+use throwback::cartridge::{parse_snes_header, CartridgeInfo, CartridgeType, SnesMapper};
+use throwback::device::{CartridgeDevice, ChipType, LegacyDevice};
 use sha2::{Digest, Sha256};
 
 const POKEMON_YELLOW_ROM_SHA256: &str =
@@ -62,7 +62,7 @@ fn e2e_dump_rom_matches_known_hash() {
 fn e2e_snes_dump_rom_matches_known_hash() {
     // Uses the PID-dispatching factory so it picks the SN Operator's streaming path.
     let mut device =
-        flashback::device::open().expect("Operator not found — is the SN Operator plugged in?");
+        throwback::device::open().expect("Operator not found — is the SN Operator plugged in?");
 
     let sig = device
         .read_cartridge_info()

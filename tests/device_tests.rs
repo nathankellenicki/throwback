@@ -1,4 +1,4 @@
-use flashback::device::{ChipType, build_command, is_open_bus};
+use throwback::device::{ChipType, build_command, is_open_bus};
 
 #[test]
 fn test_build_command_signature() {

@@ -210,19 +210,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "flashback"
-version = "0.1.0"
-dependencies = [
- "clap",
- "crc",
- "hex",
- "png",
- "serialport",
- "sha2",
- "thiserror",
-]
-
-[[package]]
 name = "flate2"
 version = "1.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -446,6 +433,19 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
+]
+
+[[package]]
+name = "throwback"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "crc",
+ "hex",
+ "png",
+ "serialport",
+ "sha2",
+ "thiserror",
 ]
 
 [[package]]

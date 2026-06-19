@@ -1,5 +1,5 @@
-use flashback::cartridge::*;
-use flashback::device::ChipType;
+use throwback::cartridge::*;
+use throwback::device::ChipType;
 
 #[test]
 fn test_format_size() {

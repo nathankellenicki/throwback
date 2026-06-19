@@ -11,7 +11,7 @@ use std::process;
 const GBA_MAX_ROM: u32 = 32 * 1024 * 1024; // 32 MB
 
 #[derive(Parser)]
-#[command(name = "flashback", about = "CLI for the Epilogue GB/SN Operator")]
+#[command(name = "throwback", about = "CLI for the Epilogue GB/SN Operator")]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
