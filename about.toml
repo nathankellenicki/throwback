@@ -1,0 +1,35 @@
+# Configuration for cargo-about — generates THIRD_PARTY_NOTICES.md at release
+# time by walking the dependency tree of the release binary and gathering
+# each crate's license text.
+#
+# Run manually with:
+#   cargo about generate about.hbs -o THIRD_PARTY_NOTICES.md
+
+# Licenses that appear in our dependency tree and are acceptable to ship.
+# If cargo-about encounters a crate with a license not in this list, the
+# generate command fails — which is the right behavior, since a surprise
+# GPL crate would be a licensing problem we'd want to see.
+accepted = [
+    "Apache-2.0",
+    "MIT",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "MPL-2.0",
+    "Unicode-DFS-2016",
+    "Unicode-3.0",
+    "Zlib",
+    "CC0-1.0",
+]
+
+# Only care about what ends up in the shipped binary.
+targets = [
+    "aarch64-apple-darwin",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-pc-windows-msvc",
+]
+
+# Don't emit notices for our own crates.
+ignore-build-dependencies = true
+ignore-dev-dependencies = true
+ignore-transitive-dependencies = false

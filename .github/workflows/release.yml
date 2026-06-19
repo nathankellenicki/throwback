@@ -1,0 +1,168 @@
+name: Release
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: macos-15
+            target: aarch64-apple-darwin
+            platform: macos
+            arch: arm64
+            binary: throwback
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            platform: linux
+            arch: arm64
+            binary: throwback
+          - os: windows-2025
+            target: x86_64-pc-windows-msvc
+            platform: windows
+            arch: x64
+            binary: throwback.exe
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install Linux packaging tools (host)
+        if: matrix.platform == 'linux'
+        run: sudo apt-get update && sudo apt-get install -y zip
+
+      # Generates THIRD_PARTY_NOTICES.md covering every Rust crate statically
+      # linked into the release binary. Runs on the host (not inside the
+      # Linux build container) since cargo-about resolves targets from
+      # about.toml and doesn't need the target toolchain.
+      - name: Install cargo-about
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-about
+
+      - name: Generate third-party notices
+        run: cargo about generate about.hbs -o THIRD_PARTY_NOTICES.md
+
+      # Linux: build inside a Debian Bullseye container (glibc 2.31) so the
+      # released binary runs on Bullseye / Bookworm / modern Ubuntu. Without
+      # this, the runner's native glibc (2.39 on ubuntu-24.04) gets baked in
+      # and the binary fails on any Raspberry Pi OS released before 2024.
+      #
+      # The runner is already aarch64, so the container runs natively — no
+      # cross-compilation, no zig, no glibc symbol mismatches between host
+      # libudev/libdbus and the target binary.
+      - name: Build (Linux, Bullseye container)
+        if: matrix.platform == 'linux'
+        run: |
+          docker run --rm \
+            -v "$PWD":/work \
+            -w /work \
+            -e CARGO_HOME=/work/.cargo \
+            -e CARGO_TARGET_DIR=/work/target \
+            -e HOST_UID=$(id -u) \
+            -e HOST_GID=$(id -g) \
+            arm64v8/debian:bullseye \
+            bash -c '
+              set -euo pipefail
+              apt-get update
+              apt-get install -y --no-install-recommends \
+                curl ca-certificates build-essential pkg-config \
+                libdbus-1-dev libudev-dev
+              curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs \
+                | sh -s -- -y --profile minimal --default-toolchain stable
+              . "$CARGO_HOME/env"
+              cargo build --release --bin throwback --target ${{ matrix.target }}
+              # Hand build artifacts back to the runner user so later
+              # (non-root) steps can read/zip them.
+              chown -R "$HOST_UID:$HOST_GID" target .cargo
+            '
+
+      - name: Build (macOS / Windows)
+        if: matrix.platform != 'linux'
+        run: cargo build --release --bin throwback --target ${{ matrix.target }}
+
+      - name: Sign and notarize (macOS)
+        if: matrix.platform == 'macos'
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_ID_PASSWORD: ${{ secrets.APPLE_ID_PASSWORD }}
+        run: |
+          # Import certificate into temporary keychain
+          KEYCHAIN_PATH=$RUNNER_TEMP/signing.keychain-db
+          KEYCHAIN_PASSWORD=$(uuidgen)
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+
+          CERT_PATH=$RUNNER_TEMP/certificate.p12
+          echo "$APPLE_CERTIFICATE" | base64 --decode > "$CERT_PATH"
+          security import "$CERT_PATH" -P "$APPLE_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+          security set-key-partition-list -S apple-tool:,apple: -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security list-keychains -d user -s "$KEYCHAIN_PATH" login.keychain
+
+          # Find signing identity
+          BINARY_PATH="target/${{ matrix.target }}/release/${{ matrix.binary }}"
+          IDENTITY=$(security find-identity -v -p codesigning "$KEYCHAIN_PATH" | grep "Developer ID Application" | head -1 | awk -F'"' '{print $2}')
+          if [ -z "$IDENTITY" ]; then
+            echo "No Developer ID Application identity found. Available identities:"
+            security find-identity -v -p codesigning "$KEYCHAIN_PATH"
+            exit 1
+          fi
+          echo "Signing with: $IDENTITY"
+
+          # Sign the binary
+          codesign --force --options runtime --sign "$IDENTITY" "$BINARY_PATH"
+
+          # Notarize: zip the binary, submit, wait, staple
+          NOTARIZE_ZIP=$RUNNER_TEMP/notarize.zip
+          ditto -c -k --keepParent "$BINARY_PATH" "$NOTARIZE_ZIP"
+          xcrun notarytool submit "$NOTARIZE_ZIP" --apple-id "$APPLE_ID" --password "$APPLE_ID_PASSWORD" --team-id "$APPLE_TEAM_ID" --wait
+
+          # Clean up keychain
+          security delete-keychain "$KEYCHAIN_PATH"
+
+      - name: Package (Unix)
+        if: matrix.platform != 'windows'
+        run: |
+          STAGING=$(mktemp -d)
+          mkdir -p "$STAGING/throwback"
+          cp "target/${{ matrix.target }}/release/${{ matrix.binary }}" "$STAGING/throwback/"
+          cp README.md "$STAGING/throwback/"
+          cp LICENSE "$STAGING/throwback/"
+          cp THIRD_PARTY_NOTICES.md "$STAGING/throwback/"
+          cd "$STAGING"
+          zip -r "throwback-${{ github.event.release.tag_name }}-${{ matrix.platform }}-${{ matrix.arch }}.zip" throwback/
+          mv *.zip "$GITHUB_WORKSPACE/"
+
+      - name: Package (Windows)
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        run: |
+          $staging = Join-Path $env:TEMP "throwback-release"
+          if (Test-Path $staging) { Remove-Item $staging -Recurse -Force }
+          New-Item -ItemType Directory -Path "$staging\throwback" | Out-Null
+          Copy-Item "target\${{ matrix.target }}\release\${{ matrix.binary }}" "$staging\throwback\"
+          Copy-Item "README.md" "$staging\throwback\"
+          Copy-Item "LICENSE" "$staging\throwback\"
+          Copy-Item "THIRD_PARTY_NOTICES.md" "$staging\throwback\"
+          Compress-Archive -Path "$staging\throwback" -DestinationPath "throwback-${{ github.event.release.tag_name }}-${{ matrix.platform }}-${{ matrix.arch }}.zip"
+          Remove-Item $staging -Recurse -Force
+
+      - name: Upload to release
+        uses: softprops/action-gh-release@v3
+        with:
+          files: throwback-*.zip

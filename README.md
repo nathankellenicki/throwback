@@ -1,6 +1,6 @@
 # throwback
 
-A command-line tool for reading and writing game cartridges with Epilogue's GB Operator and SN Operator.
+A CLI for reading and writing game cartridges with Epilogue's GB Operator and SN Operator.
 
 It dumps ROMs, backs up and restores saves, reads and sets the real-time clock on Pokémon carts, pulls the photos off a Game Boy Camera, and writes ROMs to flash carts.
 
@@ -12,6 +12,22 @@ throwback is an independent project. It talks to the Operator hardware over USB 
 - **SN Operator**: Super Nintendo / Super Famicom
 
 Plug the Operator into USB and insert a cartridge. throwback finds the device on its own; there's no port to pick or device to select.
+
+## Install
+
+macOS and Linux:
+
+```
+curl -fsSL https://raw.githubusercontent.com/nathankellenicki/throwback/main/scripts/install.sh | sh
+```
+
+Windows (PowerShell):
+
+```
+irm https://raw.githubusercontent.com/nathankellenicki/throwback/main/scripts/install.ps1 | iex
+```
+
+This drops throwback in `~/.throwback/` and puts it on your PATH. Run `throwback` to start. Or grab a build from the [latest release](https://github.com/nathankellenicki/throwback/releases), unpack it, and run the binary directly.
 
 ## Building
 

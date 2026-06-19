@@ -1,0 +1,31 @@
+# Third-Party Notices
+
+throwback's release binary statically links the Rust crates listed below.
+Each crate's upstream license is reproduced in full, as required by the
+respective license terms. throwback itself is licensed under the Apache
+License, Version 2.0; see [LICENSE](LICENSE) for its terms.
+
+## Summary
+
+{{#each overview}}
+- **{{name}}**: {{count}} crate{{#if (gt count 1)}}s{{/if}}
+{{/each}}
+
+---
+
+{{#each licenses}}
+## {{name}}
+
+Used by:
+
+{{#each used_by}}
+- `{{crate.name}}` {{crate.version}}{{#if crate.repository}} — <{{crate.repository}}>{{/if}}
+{{/each}}
+
+```
+{{text}}
+```
+
+---
+
+{{/each}}
