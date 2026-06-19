@@ -1,17 +1,17 @@
-# throwback
+# Throwback
 
 A CLI for working with Epilogue's GB Operator and SN Operator.
 
 It dumps ROMs, backs up and restores saves, reads and sets the real-time clock on Pokémon carts, pulls the photos off a Game Boy Camera, and writes ROMs to flash carts.
 
-throwback is an independent project. It talks to the Operator hardware over USB but is not affiliated with Epilogue.
+Throwback is an independent project. It talks to the Operator hardware over USB but is not affiliated with Epilogue.
 
 ## What it works with
 
 - **GB Operator**: Game Boy, Game Boy Color, Game Boy Advance
 - **SN Operator**: Super Nintendo / Super Famicom
 
-Plug the Operator into USB and insert a cartridge. throwback finds the device on its own; there's no port to pick or device to select.
+Plug the Operator into USB and insert a cartridge. Throwback finds the device on its own; there's no port to pick or device to select.
 
 ## Install
 
@@ -27,11 +27,11 @@ Windows (PowerShell):
 irm https://raw.githubusercontent.com/nathankellenicki/throwback/main/scripts/install.ps1 | iex
 ```
 
-This drops throwback in `~/.throwback/` and puts it on your PATH. Run `throwback` to start. Or grab a build from the [latest release](https://github.com/nathankellenicki/throwback/releases), unpack it, and run the binary directly.
+This drops Throwback in `~/.throwback/` and puts it on your PATH. Run `throwback` to start. Or grab a build from the [latest release](https://github.com/nathankellenicki/throwback/releases), unpack it, and run the binary directly.
 
 ## Building
 
-throwback is written in Rust. Rust 1.85 or newer required.
+Throwback is written in Rust. Rust 1.85 or newer required.
 
 ```
 cargo build --release
@@ -87,7 +87,7 @@ throwback read-save crystal.sav
 throwback write-save crystal.sav
 ```
 
-Saves are raw SRAM, the same format emulators use, so a backup moves between throwback and an emulator without any conversion. `write-save` replaces the save on the cart, so keep the original somewhere safe.
+Saves are raw SRAM, the same format emulators use, so a backup moves between Throwback and an emulator without any conversion. `write-save` replaces the save on the cart, so keep the original somewhere safe.
 
 ### read-rtc and write-rtc
 
@@ -109,7 +109,7 @@ throwback write-rtc --days 5 --hours 12 --minutes 30 --seconds 0
 throwback write-rtc --input crystal.rtc
 ```
 
-If the cart's battery has died the clock reads back out-of-range values, and throwback tells you so.
+If the cart's battery has died the clock reads back out-of-range values, and Throwback tells you so.
 
 ### read-camera
 
@@ -140,7 +140,7 @@ Write a ROM to a flash cart.
 throwback write-rom homebrew.gbc
 ```
 
-This erases the cart and writes the new ROM, so it only makes sense on a flashable cart. throwback checks the cartridge first and refuses to touch a retail game. If you have a reason to write anyway, pass `--force`. The ROM is padded and aligned for you, so hand it the file as-is.
+This erases the cart and writes the new ROM, so it only makes sense on a flashable cart. Throwback checks the cartridge first and refuses to touch a retail game. If you have a reason to write anyway, pass `--force`. The ROM is padded and aligned for you, so hand it the file as-is.
 
 ### apply-patch
 
@@ -150,10 +150,10 @@ Apply an IPS patch to a ROM file. This is useful for homebrew updates or ROM hac
 throwback apply-patch homebrew.gbc update.ips -o homebrew_patched.gbc
 ```
 
-The patched ROM is validated against its header checksum for Game Boy / Game Boy Color and Game Boy Advance ROMs. If validation fails, the output is not written unless you pass `--ignore-checksum`. A ROM in another format (SNES, for example) has no header checksum throwback can verify, so it's written without that check.
+The patched ROM is validated against its header checksum for Game Boy / Game Boy Color and Game Boy Advance ROMs. If validation fails, the output is not written unless you pass `--ignore-checksum`. A ROM in another format (SNES, for example) has no header checksum Throwback can verify, so it's written without that check.
 
 ## Worth knowing
 
 - Clean the contacts. A dirty cartridge reads back corrupt data, and `info` can report an empty slot even with a cart inserted.
 - Writing a save or a ROM cannot be undone. Back up first.
-- A few carts read back data that doesn't match the canonical database dumps. This is the hardware's doing, not throwback's; the official software reads them the same way.
+- A few carts read back data that doesn't match the canonical database dumps. This is the hardware's doing, not Throwback's; the official software reads them the same way.

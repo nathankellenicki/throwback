@@ -1,7 +1,7 @@
 #!/bin/sh
-# throwback installer
+# Throwback installer
 #
-# Install or update throwback with:
+# Install or update Throwback with:
 #
 #   curl -fsSL https://raw.githubusercontent.com/nathankellenicki/throwback/main/scripts/install.sh | sh
 #
@@ -34,7 +34,7 @@ if [ -z "$VERSION" ]; then
     exit 1
 fi
 
-echo "Installing throwback $VERSION for $PLATFORM..."
+echo "Installing Throwback $VERSION for $PLATFORM..."
 
 # ── Download and extract ─────────────────────────
 
@@ -71,7 +71,7 @@ ln -sf "$INSTALL_DIR/throwback" "$LINK_DIR/throwback"
 # ── Done ─────────────────────────────────────────
 
 echo ""
-echo "throwback $VERSION installed successfully."
+echo "Throwback $VERSION installed successfully."
 echo ""
 
 # Check if the symlink dir is on PATH

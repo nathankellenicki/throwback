@@ -6,7 +6,7 @@ $version = (Select-String -Path "Cargo.toml" -Pattern '^version' | Select-Object
 $arch = if ([System.Environment]::Is64BitOperatingSystem) { "x64" } else { "x86" }
 $zipName = "throwback-v${version}-windows-${arch}.zip"
 
-Write-Host "Building throwback v${version} for windows-${arch}..."
+Write-Host "Building Throwback v${version} for windows-${arch}..."
 cargo build --release --bin throwback
 if ($LASTEXITCODE -ne 0) { exit 1 }
 

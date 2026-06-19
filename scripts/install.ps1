@@ -1,6 +1,6 @@
-# throwback installer for Windows
+# Throwback installer for Windows
 #
-# Install or update throwback with:
+# Install or update Throwback with:
 #
 #   irm https://raw.githubusercontent.com/nathankellenicki/throwback/main/scripts/install.ps1 | iex
 #
@@ -30,7 +30,7 @@ if (-not $Version) {
     exit 1
 }
 
-Write-Host "Installing throwback $Version for $Platform..."
+Write-Host "Installing Throwback $Version for $Platform..."
 
 # ── Download and extract ─────────────────────────
 
@@ -66,7 +66,7 @@ if ($UserPath -notlike "*$InstallDir*") {
 # ── Done ─────────────────────────────────────────
 
 Write-Host ""
-Write-Host "throwback $Version installed successfully."
+Write-Host "Throwback $Version installed successfully."
 Write-Host ""
 Write-Host "Run 'throwback' to get started."
 Write-Host ""

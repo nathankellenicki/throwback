@@ -28,7 +28,7 @@ fi
 
 ZIP_NAME="throwback-v${VERSION}-${PLATFORM}-${ARCH}.zip"
 
-echo "Building throwback v${VERSION} for ${PLATFORM}-${ARCH}..."
+echo "Building Throwback v${VERSION} for ${PLATFORM}-${ARCH}..."
 cargo build --release --bin throwback
 
 # Generate third-party license notices for everything statically linked into
