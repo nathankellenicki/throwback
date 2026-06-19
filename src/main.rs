@@ -7,7 +7,7 @@ use throwback::cartridge::{
     trim_gba_rom,
 };
 use throwback::device::{self, CartridgeDevice, ChipType};
-use throwback::patch::{self, IpsPatch};
+use throwback::patch::{self, Patch};
 
 const GBA_MAX_ROM: u32 = 32 * 1024 * 1024; // 32 MB
 
@@ -49,7 +49,7 @@ enum Commands {
         #[arg(long)]
         force: bool,
     },
-    /// Apply an IPS patch to a ROM file
+    /// Apply an IPS, UPS, or BPS patch to a ROM file
     ApplyPatch {
         /// Source ROM file
         rom: PathBuf,
@@ -148,13 +148,22 @@ fn apply_patch(rom_path: &PathBuf, patch_path: &PathBuf, output: &PathBuf, ignor
         process::exit(1);
     });
 
-    let patch = IpsPatch::load(&patch_data).unwrap_or_else(|e| {
+    let patch = Patch::load(&patch_data).unwrap_or_else(|e| {
         eprintln!("Error parsing patch: {e}");
         process::exit(1);
     });
 
+    let format = patch.format_name();
     let original_len = rom.len();
-    let patched = patch.apply_into(rom);
+    // UPS/BPS verify the source ROM's CRC32 before applying (a mismatch is a hard
+    // error unless --ignore-checksum). IPS has no such check and applies in place.
+    let patched = patch.apply_into(rom, !ignore_checksum).unwrap_or_else(|e| {
+        eprintln!("Error applying {format} patch: {e}");
+        if !ignore_checksum {
+            eprintln!("Pass --ignore-checksum to bypass checksum verification.");
+        }
+        process::exit(1);
+    });
 
     // An empty result (e.g. a truncate-to-0 patch) is never a usable ROM, so
     // refuse it regardless of --ignore-checksum.
@@ -163,7 +172,13 @@ fn apply_patch(rom_path: &PathBuf, patch_path: &PathBuf, output: &PathBuf, ignor
         process::exit(1);
     }
 
-    if !ignore_checksum {
+    if ignore_checksum {
+        // verification skipped entirely below
+    } else if patch.has_checksums() {
+        // UPS/BPS already verified source and target CRC32 inside apply.
+        eprintln!("{format} source and target checksums OK.");
+    } else {
+        // IPS: fall back to the header-checksum heuristic.
         match patch::validate_patched_rom(&patched) {
             patch::Validation::Ok => eprintln!("Header checksum OK."),
             patch::Validation::Skipped(reason) => {
@@ -192,7 +207,7 @@ fn apply_patch(rom_path: &PathBuf, patch_path: &PathBuf, output: &PathBuf, ignor
     );
 
     if ignore_checksum {
-        eprintln!("Warning: skipped header-checksum validation.");
+        eprintln!("Warning: skipped checksum verification.");
     }
 }
 

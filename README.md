@@ -2,7 +2,7 @@
 
 A CLI for working with Epilogue's GB Operator and SN Operator.
 
-It dumps ROMs, backs up and restores saves, reads and sets the real-time clock on Pokémon carts, pulls the photos off a Game Boy Camera, and writes ROMs to flash carts.
+It dumps ROMs, backs up and restores saves, reads and sets the real-time clock on Pokémon carts, pulls the photos off a Game Boy Camera, writes ROMs to flash carts, and applies IPS, UPS, and BPS patches.
 
 Throwback is an independent project. It talks to the Operator hardware over USB but is not affiliated with Epilogue.
 
@@ -144,13 +144,16 @@ This erases the cart and writes the new ROM, so it only makes sense on a flashab
 
 ### apply-patch
 
-Apply an IPS patch to a ROM file. This is useful for homebrew updates or ROM hacks before writing them to a flash cart.
+Apply an IPS, UPS, or BPS patch to a ROM file, useful for homebrew updates or ROM hacks before writing them to a flash cart. The format is detected from the patch itself, not the file extension.
 
 ```
 throwback apply-patch homebrew.gbc update.ips -o homebrew_patched.gbc
+throwback apply-patch base.gba hack.bps -o hacked.gba
 ```
 
-The patched ROM is validated against its header checksum for Game Boy / Game Boy Color and Game Boy Advance ROMs. If validation fails, the output is not written unless you pass `--ignore-checksum`. A ROM in another format (SNES, for example) has no header checksum Throwback can verify, so it's written without that check.
+UPS and BPS patches carry checksums of the ROM they expect and the result they produce, so Throwback verifies you fed it the right base ROM before applying and that the output is correct. A mismatch is an error; pass `--ignore-checksum` to apply anyway.
+
+IPS has no such checksums, so for IPS the patched ROM is instead checked against its Game Boy / Game Boy Color or Game Boy Advance header checksum. If that fails, the output is not written unless you pass `--ignore-checksum`. A ROM in another format (SNES, for example) has no header checksum Throwback can verify, so it's written without that check.
 
 ## Worth knowing
 

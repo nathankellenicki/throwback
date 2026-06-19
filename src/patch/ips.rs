@@ -139,67 +139,6 @@ fn read_u24(buf: &[u8], i: usize) -> u32 {
     u32::from_be_bytes([0, buf[i], buf[i + 1], buf[i + 2]])
 }
 
-/// The outcome of validating a patched ROM's header checksum.
-#[derive(Debug)]
-pub enum Validation {
-    /// A recognised format's header checksum matched.
-    Ok,
-    /// A recognised format's header checksum did not match — likely the wrong
-    /// base ROM or a corrupt result. The string describes the mismatch.
-    Mismatch(String),
-    /// The ROM format was not recognised, so there is nothing to validate
-    /// (e.g. SNES, which has no simple header checksum, or homebrew). The
-    /// string explains why validation was skipped.
-    Skipped(String),
-}
-
-/// The first bytes of the Nintendo boot logo stored at 0x104 in every GB/GBC
-/// ROM. An exact match reliably identifies a Game Boy ROM.
-const GB_LOGO_PREFIX: [u8; 8] = [0xCE, 0xED, 0x66, 0x66, 0xCC, 0x0D, 0x00, 0x0B];
-
-fn is_gb_rom(rom: &[u8]) -> bool {
-    rom.get(0x104..0x10C) == Some(&GB_LOGO_PREFIX[..])
-}
-
-/// GBA headers carry a fixed 0x96 byte at offset 0xB2.
-fn is_gba_rom(rom: &[u8]) -> bool {
-    rom.get(0xB2) == Some(&0x96)
-}
-
-/// Validate the patched ROM's header checksum if we recognise the format.
-///
-/// The format is detected by header *content*, not ROM length: a GBA ROM is
-/// far larger than the GB header offsets, so dispatching on length alone would
-/// always treat a GBA ROM as a GB ROM and never reach the GBA path. We check
-/// the GB boot logo first (an exact 8-byte match), then the GBA fixed-value
-/// byte.
-///
-/// Supports Game Boy / Game Boy Color (header checksum at 0x14D) and Game Boy
-/// Advance (header checksum at 0xBD), reusing the canonical checksum routines
-/// in [`crate::cartridge`]. SNES has no simple header checksum, so an
-/// unrecognised ROM yields [`Validation::Skipped`] rather than an error.
-pub fn validate_patched_rom(rom: &[u8]) -> Validation {
-    if is_gb_rom(rom) {
-        match (crate::cartridge::gb_header_checksum(rom), rom.get(0x14D)) {
-            (Some(actual), Some(&expected)) if actual == expected => Validation::Ok,
-            (Some(actual), Some(&expected)) => Validation::Mismatch(format!(
-                "GB/GBC header checksum mismatch: expected 0x{expected:02X}, got 0x{actual:02X}"
-            )),
-            _ => Validation::Skipped("ROM too short for a GB header".to_string()),
-        }
-    } else if is_gba_rom(rom) {
-        match (crate::cartridge::gba_header_checksum(rom), rom.get(0xBD)) {
-            (Some(actual), Some(&expected)) if actual == expected => Validation::Ok,
-            (Some(actual), Some(&expected)) => Validation::Mismatch(format!(
-                "GBA header checksum mismatch: expected 0x{expected:02X}, got 0x{actual:02X}"
-            )),
-            _ => Validation::Skipped("ROM too short for a GBA header".to_string()),
-        }
-    } else {
-        Validation::Skipped(format!("unrecognised ROM format ({} bytes)", rom.len()))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -280,46 +219,5 @@ mod tests {
             IpsPatch::load(&patch).unwrap_err(),
             IpsError::TrailingData(2)
         ));
-    }
-
-    fn gb_rom(len: usize) -> Vec<u8> {
-        let mut rom = vec![0u8; len];
-        rom[0x104..0x10C].copy_from_slice(&GB_LOGO_PREFIX);
-        rom
-    }
-
-    #[test]
-    fn validate_gb_good_header() {
-        let mut rom = gb_rom(0x150);
-        // For 25 zero bytes at 0x134..=0x14C the checksum is -25 (0xE7).
-        rom[0x14D] = 0xE7;
-        assert!(matches!(validate_patched_rom(&rom), Validation::Ok));
-    }
-
-    #[test]
-    fn validate_gb_bad_header() {
-        let mut rom = gb_rom(0x150);
-        rom[0x14D] = 0xFF;
-        assert!(matches!(validate_patched_rom(&rom), Validation::Mismatch(_)));
-    }
-
-    #[test]
-    fn validate_gba_header_reachable() {
-        // A GBA-sized ROM must validate via the GBA path, not be shadowed by the
-        // GB branch (regression test for length-based dispatch).
-        let mut rom = vec![0u8; 1024 * 1024];
-        rom[0xB2] = 0x96; // GBA fixed byte
-        rom[0xBD] = crate::cartridge::gba_header_checksum(&rom).unwrap();
-        assert!(matches!(validate_patched_rom(&rom), Validation::Ok));
-
-        rom[0xBD] = rom[0xBD].wrapping_add(1);
-        assert!(matches!(validate_patched_rom(&rom), Validation::Mismatch(_)));
-    }
-
-    #[test]
-    fn validate_unknown_format_skipped() {
-        // No GB logo, no GBA fixed byte → nothing to validate (e.g. SNES).
-        let rom = vec![0u8; 0x200];
-        assert!(matches!(validate_patched_rom(&rom), Validation::Skipped(_)));
     }
 }
