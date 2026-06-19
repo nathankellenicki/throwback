@@ -112,7 +112,11 @@ jobs:
           echo "$APPLE_CERTIFICATE" | base64 --decode > "$CERT_PATH"
           security import "$CERT_PATH" -P "$APPLE_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
           security set-key-partition-list -S apple-tool:,apple: -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
-          security list-keychains -d user -s "$KEYCHAIN_PATH" login.keychain
+          # Prepend the signing keychain to the search list while preserving the
+          # existing entries. Don't hardcode "login.keychain" — on current macOS
+          # the file is "login.keychain-db", and the bare name fails with
+          # errSecNoSuchKeychain (-25294) when it can't be resolved.
+          security list-keychains -d user -s "$KEYCHAIN_PATH" $(security list-keychains -d user | sed s/\"//g)
 
           # Find signing identity
           BINARY_PATH="target/${{ matrix.target }}/release/${{ matrix.binary }}"
