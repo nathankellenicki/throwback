@@ -626,3 +626,28 @@ fn test_cartridge_info_marker_dispatch() {
         assert_eq!(CartridgeInfo::from_bytes(&sig).cart_type, expected, "marker {marker:#x}");
     }
 }
+
+#[test]
+fn scale_block_duplicates_each_pixel_into_a_square() {
+    // A 2x1 image [1, 2] scaled 3x becomes 6x3, each pixel a solid 3x3 block.
+    let out = scale_block(&[1, 2], 2, 1, 3);
+    assert_eq!(out.len(), 6 * 3);
+    let row = [1, 1, 1, 2, 2, 2];
+    assert_eq!(&out[0..6], &row); // every output row is identical
+    assert_eq!(&out[6..12], &row);
+    assert_eq!(&out[12..18], &row);
+}
+
+#[test]
+fn scale_block_factor_one_is_unchanged() {
+    let src = [1u8, 2, 3, 4];
+    assert_eq!(scale_block(&src, 2, 2, 1), src);
+}
+
+#[test]
+fn scale_block_introduces_no_new_values() {
+    let src = [0u8, 255, 0, 255];
+    let out = scale_block(&src, 2, 2, 4);
+    assert!(out.iter().all(|&v| v == 0 || v == 255));
+    assert_eq!(out.len(), 8 * 8);
+}

@@ -111,6 +111,9 @@ enum Commands {
         /// Camera ROM file for --framed (with --from); otherwise read from the cart
         #[arg(long)]
         rom: Option<PathBuf>,
+        /// Scale each exported image by an integer factor via pixel duplication, e.g. 2x or 10x
+        #[arg(long, value_parser = parse_scaling, default_value = "10x")]
+        scaling: u32,
     },
     /// Read the cartridge's real-time clock (MBC3 carts)
     ReadRtc {
@@ -503,6 +506,21 @@ fn upgrade_cart(
             process::exit(1);
         }
     }
+}
+
+/// Parse a `--scaling` value like "2x", "10x", or a bare "3" into an integer factor.
+fn parse_scaling(s: &str) -> Result<u32, String> {
+    let digits = s.strip_suffix(['x', 'X']).unwrap_or(s);
+    let factor: u32 = digits
+        .parse()
+        .map_err(|_| format!("invalid scaling '{s}'; use a factor like 2x or 10"))?;
+    if factor < 1 {
+        return Err("scaling must be at least 1x".to_string());
+    }
+    if factor > 1000 {
+        return Err("scaling must be at most 1000x".to_string());
+    }
+    Ok(factor)
 }
 
 /// Write an 8-bit grayscale buffer as a PNG.
@@ -1061,7 +1079,7 @@ fn main() {
             ),
         },
 
-        Commands::ReadCamera { output, from, framed, rom } => {
+        Commands::ReadCamera { output, from, framed, rom, scaling } => {
             // Acquire the 128 KB SRAM (and, for --framed, the camera ROM) from
             // either supplied files or the cartridge.
             let (save, rom_data): (Vec<u8>, Option<Vec<u8>>) = match from {
@@ -1162,8 +1180,9 @@ fn main() {
                     eprintln!("Photo {} (slot {slot}) is out of range; skipping.", i + 1);
                     continue;
                 };
+                let pixels = cartridge::scale_block(&pixels, w as usize, h as usize, scaling as usize);
                 let path = output.join(format!("photo_{:02}.png", i + 1));
-                if let Err(e) = write_gray_png(&path, w, h, &pixels) {
+                if let Err(e) = write_gray_png(&path, w * scaling, h * scaling, &pixels) {
                     eprintln!("Error writing {}: {e}", path.display());
                     process::exit(1);
                 }

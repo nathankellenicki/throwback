@@ -562,6 +562,28 @@ pub fn decode_camera_photo(save: &[u8], slot: usize) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// Scale a row-major 8-bit image by an integer factor through literal pixel
+/// duplication: each source pixel becomes a `factor`×`factor` block of the same
+/// value. There is no interpolation, so the output contains only the pixel values
+/// the input had. A `factor` of 0 or 1 returns the image unchanged.
+pub fn scale_block(pixels: &[u8], width: usize, height: usize, factor: usize) -> Vec<u8> {
+    if factor <= 1 {
+        return pixels.to_vec();
+    }
+    let out_width = width * factor;
+    let mut out = vec![0u8; out_width * height * factor];
+    for y in 0..height {
+        for x in 0..width {
+            let value = pixels[y * width + x];
+            for dy in 0..factor {
+                let start = (y * factor + dy) * out_width + x * factor;
+                out[start..start + factor].fill(value);
+            }
+        }
+    }
+    out
+}
+
 /// A framed GB Camera photo is the full 160×144 GB screen.
 pub const CAMERA_FRAME_WIDTH: usize = 160;
 pub const CAMERA_FRAME_HEIGHT: usize = 144;

@@ -113,10 +113,16 @@ If the cart's battery has died the clock reads back out-of-range values, and Thr
 
 ### read-camera
 
-Pull the photos off a Game Boy Camera. Each photo is saved as a 128×112 PNG in the directory you give it.
+Pull the photos off a Game Boy Camera. Each photo is saved as a PNG in the directory you give it.
 
 ```
 throwback read-camera photos/
+```
+
+The camera's images are tiny (128×112, or 160×144 framed), so each photo is scaled up 10x by default by duplicating pixels, with no smoothing. Pass `--scaling` to change the factor, like `--scaling 1x` for the native size or `--scaling 20x` for larger:
+
+```
+throwback read-camera photos/ --scaling 1x
 ```
 
 Add `--framed` to render the full 160×144 screen with the border around each photo (the "Nintendo / Game Boy" frame, or the Hello Kitty borders if it's that cartridge). This reads the camera ROM too, since the frames live there.
