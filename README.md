@@ -2,7 +2,7 @@
 
 A CLI for working with Epilogue's GB Operator and SN Operator.
 
-It dumps ROMs, backs up and restores saves, reads and sets the real-time clock on Pokémon carts, pulls the photos off a Game Boy Camera, writes ROMs to flash carts, and applies IPS, UPS, and BPS patches.
+It dumps ROMs, backs up and restores saves, reads and sets the real-time clock on Pokémon carts, pulls the photos off a Game Boy Camera, writes ROMs to flash carts, applies IPS, UPS, and BPS patches, and updates games to their latest version.
 
 Throwback is an independent project. It talks to the Operator hardware over USB but is not affiliated with Epilogue.
 
@@ -154,6 +154,29 @@ throwback apply-patch base.gba hack.bps -o hacked.gba
 UPS and BPS patches carry checksums of the ROM they expect and the result they produce, so Throwback verifies you fed it the right base ROM before applying and that the output is correct. A mismatch is an error; pass `--ignore-checksum` to apply anyway.
 
 IPS has no such checksums, so for IPS the patched ROM is instead checked against its Game Boy / Game Boy Color or Game Boy Advance header checksum. If that fails, the output is not written unless you pass `--ignore-checksum`. A ROM in another format (SNES, for example) has no header checksum Throwback can verify, so it's written without that check.
+
+### upgrade
+
+Update a game to its latest version. Throwback checks an update service for a newer version of your ROM and applies the official update if there is one.
+
+(Currently only ModRetro games are supported, using the ModRetro Cart Clinic service.)
+
+Point it at a ROM file:
+
+```
+throwback upgrade dragonyhm.gbc
+throwback upgrade dragonyhm.gbc --check
+```
+
+`--check` reports what's available and changes nothing. Otherwise Throwback writes the upgraded ROM next to the input as `<title> <version>.gbc`, or wherever `-o` points, after verifying it. A service can only update games it recognizes; for anything else, Throwback tells you and stops.
+
+Run it with no file to update the inserted cartridge:
+
+```
+throwback upgrade
+```
+
+This dumps the cart, checks for an update, and flashes the new version back once you confirm by typing `y`. Pass `--write` to skip that confirmation. If the update changes the save format, Throwback says so and asks you to confirm before flashing (or pass `--acknowledge-incompatible-save`); back up the save first with `read-save` if you want to keep it. Flashing needs a writeable flash cart, the same as `write-rom`; `--force` overrides the check.
 
 ## Worth knowing
 

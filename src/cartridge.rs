@@ -473,6 +473,22 @@ pub fn gb_header_checksum(rom: &[u8]) -> Option<u8> {
     Some(x)
 }
 
+/// Compute the GB/GBC global checksum (the 16-bit value stored big-endian at
+/// 0x14E/0x14F): the 16-bit sum of every byte in the ROM except the two checksum
+/// bytes themselves. Compare against `u16::from_be_bytes([rom[0x14E], rom[0x14F]])`
+/// to validate. Returns `None` if the ROM is too short. Games don't verify this,
+/// but it's a cheap whole-ROM integrity check for a freshly patched ROM.
+pub fn gb_global_checksum(rom: &[u8]) -> Option<u16> {
+    if rom.len() < 0x150 {
+        return None;
+    }
+    let total: u32 = rom.iter().map(|&b| b as u32).sum();
+    let sum = total
+        .wrapping_sub(rom[0x14E] as u32)
+        .wrapping_sub(rom[0x14F] as u32);
+    Some((sum & 0xFFFF) as u16)
+}
+
 /// Compute the GBA header checksum (the value stored at 0xBD). Per GBATEK:
 /// `chk = 0; for 0xA0..=0xBC: chk = chk - byte; chk = chk - 0x19`. Compare against
 /// rom[0xBD] to validate. Returns `None` if the header is too short.

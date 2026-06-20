@@ -10,6 +10,9 @@ serialport = "4"
 crc = "3"
 thiserror = "2"
 png = "0.17"
+ureq = "2"
+serde_json = "1"
+base64 = "0.22"
 
 [dev-dependencies]
 sha2 = "0.10"

@@ -1,6 +1,6 @@
 use clap::{CommandFactory, Parser, Subcommand};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process;
 use throwback::cartridge::{
     self, CartridgeInfo, CartridgeType, detect_eeprom_size, detect_gba_save, format_size,
@@ -8,6 +8,7 @@ use throwback::cartridge::{
 };
 use throwback::device::{self, CartridgeDevice, ChipType};
 use throwback::patch::{self, Patch};
+use throwback::upgrade::{self, Identity, Upgrade};
 
 const GBA_MAX_ROM: u32 = 32 * 1024 * 1024; // 32 MB
 
@@ -73,6 +74,29 @@ enum Commands {
         /// Write even if the patched ROM fails header-checksum validation
         #[arg(long)]
         ignore_checksum: bool,
+    },
+    /// Check update services for a newer version of a ROM (or the inserted cart) and apply it
+    Upgrade {
+        /// ROM file to upgrade; omit to read and upgrade the inserted cartridge
+        rom: Option<PathBuf>,
+        /// Output ROM path (defaults to "<title> <version>.<ext>" next to the input)
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+        /// Report available updates without applying or flashing anything
+        #[arg(long)]
+        check: bool,
+        /// Cart mode: flash without the interactive confirmation
+        #[arg(long)]
+        write: bool,
+        /// Proceed past a save-incompatible update without the interactive prompt
+        #[arg(long)]
+        acknowledge_incompatible_save: bool,
+        /// Skip verification of the upgraded ROM
+        #[arg(long)]
+        ignore_checksum: bool,
+        /// Cart mode: flash even if the cart isn't a detected writeable flashcart
+        #[arg(long)]
+        force: bool,
     },
     /// Extract photos from a Game Boy Camera cartridge (or a camera .sav)
     ReadCamera {
@@ -220,6 +244,264 @@ fn apply_patch(rom_path: &PathBuf, patch_path: &PathBuf, output: &PathBuf, ignor
 
     if ignore_checksum {
         eprintln!("Warning: skipped checksum verification.");
+    }
+}
+
+/// Run the service sweep over `rom` and report. Returns `Some((id, upgrade))` when a
+/// newer version is available; otherwise prints the outcome and either returns `None`
+/// (already-latest / unknown game) or exits non-zero (service or fetch failure).
+fn resolve_update(rom: &[u8]) -> Option<(Identity, Upgrade)> {
+    eprintln!("Checking update services...");
+    let services = upgrade::services();
+    let resolution = upgrade::resolve(rom, &services, |name| eprintln!("Checking {name}..."));
+    match resolution {
+        upgrade::Resolution::AlreadyLatest(id) => {
+            println!("{} is already the latest version ({}).", id.title, id.current_version);
+            None
+        }
+        upgrade::Resolution::Update(id, up) => Some((id, up)),
+        upgrade::Resolution::Failed(id, e) => {
+            eprintln!("Update check failed for {}: {e}", id.title);
+            process::exit(1);
+        }
+        upgrade::Resolution::Unrecognized(errors) => {
+            if errors.is_empty() {
+                println!("No update service recognized this ROM.");
+            } else {
+                eprintln!("No update service recognized this ROM. Service errors:");
+                for (name, e) in errors {
+                    eprintln!("  {name}: {e}");
+                }
+                process::exit(1);
+            }
+            None
+        }
+    }
+}
+
+fn print_update_summary(id: &Identity, up: &Upgrade) {
+    println!();
+    println!(
+        "{}: {} -> {} available (via {})",
+        id.title, up.from_version, up.to_version, id.service
+    );
+    if up.save_compatible == Some(false) {
+        println!("Saves are NOT compatible across this update.");
+    }
+    if let Some(changelog) = &up.changelog {
+        println!();
+        for line in changelog.lines() {
+            println!("{line}");
+        }
+    }
+}
+
+/// Make a string safe to use as a filename.
+fn sanitize_filename(name: &str) -> String {
+    let s: String = name
+        .chars()
+        .map(|c| if c.is_alphanumeric() || " ._-()".contains(c) { c } else { '_' })
+        .collect();
+    let s = s.trim();
+    if s.is_empty() { "game".to_string() } else { s.to_string() }
+}
+
+/// Default output path for file mode: "<title> <version>.<ext>" next to the input.
+fn default_output_name(input: &Path, id: &Identity, up: &Upgrade) -> PathBuf {
+    let ext = input.extension().and_then(|e| e.to_str()).unwrap_or("gbc");
+    let name = format!("{} {}.{ext}", sanitize_filename(&id.title), up.to_version);
+    match input.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p.join(name),
+        _ => PathBuf::from(name),
+    }
+}
+
+fn upgrade_file(path: &Path, output: Option<&Path>, check: bool, ignore_checksum: bool) {
+    let rom = fs::read(path).unwrap_or_else(|e| {
+        eprintln!("Error reading ROM: {e}");
+        process::exit(1);
+    });
+
+    let Some((id, up)) = resolve_update(&rom) else {
+        return;
+    };
+    print_update_summary(&id, &up);
+    if check {
+        return;
+    }
+    println!();
+
+    let upgraded = upgrade::produce_upgraded_rom(&up, rom, !ignore_checksum).unwrap_or_else(|e| {
+        eprintln!("Error applying update: {e}");
+        if !ignore_checksum {
+            eprintln!("Pass --ignore-checksum to bypass verification.");
+        }
+        process::exit(1);
+    });
+
+    let out_path = match output {
+        Some(p) => p.to_path_buf(),
+        None => default_output_name(path, &id, &up),
+    };
+    if out_path == path {
+        eprintln!("Refusing to overwrite the input ROM; pass -o <path> for the output.");
+        process::exit(1);
+    }
+
+    fs::write(&out_path, &upgraded).unwrap_or_else(|e| {
+        eprintln!("Error writing output: {e}");
+        process::exit(1);
+    });
+    println!(
+        "Upgraded {} {} -> {}; wrote {}",
+        id.title,
+        up.from_version,
+        up.to_version,
+        out_path.display()
+    );
+    if ignore_checksum {
+        eprintln!("Warning: skipped verification.");
+    }
+}
+
+/// Dump the inserted cart's ROM into memory (GBA is auto-trimmed), for the sweep.
+fn dump_cart_rom(device: &mut dyn CartridgeDevice, info: &CartridgeInfo) -> Vec<u8> {
+    let mut read = |chip, size: u32, save| {
+        device.read_rom(chip, size, save, &|cur| print_progress("Reading", cur, size))
+            .unwrap_or_else(|e| {
+                eprintln!("\nError: {e}");
+                process::exit(1);
+            })
+    };
+    match info.cart_type {
+        CartridgeType::GB => {
+            eprintln!("Reading cartridge ROM ({})...", format_size(info.rom_size));
+            read(ChipType::Unknown, info.rom_size, info.ram_size)
+        }
+        CartridgeType::GBA => {
+            eprintln!("Reading GBA ROM (up to {}, will auto-trim)...", format_size(GBA_MAX_ROM));
+            let rom = read(ChipType::Unknown, GBA_MAX_ROM, 0);
+            let n = trim_gba_rom(&rom);
+            rom[..n].to_vec()
+        }
+        CartridgeType::SNES => {
+            eprintln!("Reading SNES ROM ({})...", format_size(info.rom_size));
+            read(ChipType::Unknown, info.rom_size, 0)
+        }
+    }
+}
+
+/// Prompt for a typed `y` on the terminal. Returns false (without blocking) when
+/// stdin isn't a TTY — automation should pass the relevant bypass flag instead.
+fn confirm(prompt: &str) -> bool {
+    use std::io::{IsTerminal, Write};
+    if !std::io::stdin().is_terminal() {
+        eprintln!("{prompt} [y/N] — no terminal; pass the bypass flag for automation.");
+        return false;
+    }
+    eprint!("{prompt} [y/N] ");
+    let _ = std::io::stderr().flush();
+    let mut line = String::new();
+    if std::io::stdin().read_line(&mut line).is_err() {
+        return false;
+    }
+    matches!(line.trim(), "y" | "Y" | "yes" | "Yes")
+}
+
+#[allow(clippy::fn_params_excessive_bools)]
+fn upgrade_cart(
+    output: Option<&Path>,
+    check: bool,
+    write: bool,
+    acknowledge_incompatible_save: bool,
+    ignore_checksum: bool,
+    force: bool,
+) {
+    let mut device = open_device();
+    let info = read_cart_info(device.as_mut());
+    let rom = dump_cart_rom(device.as_mut(), &info);
+
+    let Some((id, up)) = resolve_update(&rom) else {
+        return;
+    };
+    print_update_summary(&id, &up);
+    if check {
+        return;
+    }
+    println!();
+
+    let upgraded = upgrade::produce_upgraded_rom(&up, rom, !ignore_checksum).unwrap_or_else(|e| {
+        eprintln!("Error applying update: {e}");
+        if !ignore_checksum {
+            eprintln!("Pass --ignore-checksum to bypass verification.");
+        }
+        process::exit(1);
+    });
+
+    // Keep a copy on disk if requested (written before flashing, so it survives even
+    // if the flash fails).
+    if let Some(out) = output {
+        fs::write(out, &upgraded).unwrap_or_else(|e| {
+            eprintln!("Error writing output: {e}");
+            process::exit(1);
+        });
+        eprintln!("Wrote {}", out.display());
+    }
+
+    // Save-incompatibility acknowledgement (only matters if the cart holds a save).
+    if up.save_compatible == Some(false) && info.ram_size > 0 && !acknowledge_incompatible_save {
+        eprintln!(
+            "This update is NOT save-compatible; the save on your cartridge may not carry over."
+        );
+        eprintln!("Back up the save first with `throwback read-save` if you want to keep it.");
+        if !confirm("Continue and flash anyway?") {
+            eprintln!("Aborted.");
+            process::exit(1);
+        }
+    }
+
+    // Flash confirmation.
+    if !write
+        && !confirm(&format!(
+            "Flash {} {} to the cartridge? This erases it.",
+            id.title, up.to_version
+        ))
+    {
+        eprintln!("Aborted.");
+        process::exit(1);
+    }
+
+    // Flashcart-writeable guard (same as write-rom).
+    if !force {
+        match device.detect_flashcart() {
+            Ok(d) if !cartridge::flashcart_writeable(&d) => {
+                eprintln!(
+                    "Refusing to write: this cartridge is not a writeable flashcart (retail / mask ROM)."
+                );
+                eprintln!("Pass --force to override.");
+                process::exit(1);
+            }
+            _ => {}
+        }
+    }
+
+    // Pad to a 64-byte boundary and flash.
+    let mut padded = upgraded;
+    if !padded.len().is_multiple_of(64) {
+        padded.resize(padded.len() + (64 - padded.len() % 64), 0xFF);
+    }
+    eprintln!("Writing {} to the cartridge...", format_size(padded.len() as u32));
+    match device.write_rom(
+        &padded,
+        info.ram_size,
+        &|cur| print_progress("Writing", cur, padded.len() as u32),
+        &|msg| eprintln!("\r{msg}    "),
+    ) {
+        Ok(()) => eprintln!("Upgraded {} to {} on the cartridge.", id.title, up.to_version),
+        Err(e) => {
+            eprintln!("\nError: {e}");
+            process::exit(1);
+        }
     }
 }
 
@@ -758,6 +1040,26 @@ fn main() {
         Commands::ApplyPatch { rom, patch, output, ignore_checksum } => {
             apply_patch(&rom, &patch, &output, ignore_checksum);
         }
+
+        Commands::Upgrade {
+            rom,
+            output,
+            check,
+            write,
+            acknowledge_incompatible_save,
+            ignore_checksum,
+            force,
+        } => match rom {
+            Some(path) => upgrade_file(&path, output.as_deref(), check, ignore_checksum),
+            None => upgrade_cart(
+                output.as_deref(),
+                check,
+                write,
+                acknowledge_incompatible_save,
+                ignore_checksum,
+                force,
+            ),
+        },
 
         Commands::ReadCamera { output, from, framed, rom } => {
             // Acquire the 128 KB SRAM (and, for --framed, the camera ROM) from
