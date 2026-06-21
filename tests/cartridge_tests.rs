@@ -738,3 +738,32 @@ fn inject_camera_photo_into_real_save() {
     assert_eq!(gb_camera_checksum(&save[0x11B2..0x11B2 + 30]), [save[0x11D5], save[0x11D6]]);
     assert_eq!(&save[0x11B2..0x11B2 + 37], &save[0x11D7..0x11D7 + 37]);
 }
+
+/// The 48-byte RTC trailer from a real mGBA/VBA-M Pokémon Crystal `.sav` (the second
+/// file the user supplied). Locks the VBA-M/mGBA format empirically: 10 little-endian
+/// u32 registers (current + latched) + a 64-bit unix timestamp, and confirms
+/// RtcData::parse / to_payload round-trips the register block byte-for-byte.
+#[test]
+fn rtc_trailer_matches_real_crystal_save() {
+    let trailer: [u8; 48] = [
+        0x04, 0, 0, 0, 0x35, 0, 0, 0, 0x0d, 0, 0, 0, 0x06, 0, 0, 0, 0x80, 0, 0, 0, // current
+        0x04, 0, 0, 0, 0x35, 0, 0, 0, 0x0d, 0, 0, 0, 0x06, 0, 0, 0, 0x80, 0, 0, 0, // latched
+        0x5b, 0xeb, 0x1d, 0x57, 0, 0, 0, 0, // 64-bit LE timestamp (2016-04-25)
+    ];
+
+    let regs = &trailer[..40];
+    let rtc = RtcData::parse(regs).expect("parse register block");
+    assert_eq!(rtc.seconds, 4);
+    assert_eq!(rtc.minutes, 53);
+    assert_eq!(rtc.hours, 13);
+    assert_eq!(rtc.days, 6);
+    assert!(!rtc.halt);
+    assert!(rtc.day_carry); // control byte 0x80
+
+    // Round-trip: re-serializing reproduces the exact 40-byte register block.
+    assert_eq!(rtc.to_payload(), regs);
+
+    // Timestamp is a 64-bit little-endian unix time.
+    let ts = u64::from_le_bytes(trailer[40..48].try_into().unwrap());
+    assert_eq!(ts, 1_461_578_587);
+}

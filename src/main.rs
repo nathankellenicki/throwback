@@ -48,11 +48,17 @@ enum Commands {
     ReadSave {
         /// Output file path
         output: PathBuf,
+        /// Write raw SRAM only, without appending the cartridge's RTC
+        #[arg(long)]
+        no_rtc: bool,
     },
     /// Write save data from a file
     WriteSave {
         /// Input file path
         input: PathBuf,
+        /// Ignore any RTC bundled in the save file (write SRAM only)
+        #[arg(long)]
+        no_rtc: bool,
         /// Skip the confirmation prompt
         #[arg(short, long)]
         yes: bool,
@@ -112,8 +118,8 @@ enum Commands {
         #[arg(short, long)]
         yes: bool,
     },
-    /// Extract photos from a Game Boy Camera cartridge (or a camera .sav)
-    ReadCamera {
+    /// Read the photos off a Game Boy Camera (cartridge or save file)
+    ReadPhotos {
         /// Output directory for the decoded PNGs
         output: PathBuf,
         /// Decode an existing camera save file instead of reading the cartridge
@@ -129,9 +135,9 @@ enum Commands {
         #[arg(long, value_parser = parse_scaling, default_value = "10x")]
         scaling: u32,
     },
-    /// Inject a PNG as a new photo into a Game Boy Camera (cartridge or save file)
-    WriteCamera {
-        /// PNG to inject (any size/color; converted to the camera's 128x112 4-shade format)
+    /// Add a photo to a Game Boy Camera (cartridge or save file)
+    WritePhoto {
+        /// PNG to add (any size/color; converted to the camera's 128x112 4-shade format)
         image: PathBuf,
         /// Camera save file to inject into; omit to read the inserted cartridge
         #[arg(long)]
@@ -870,7 +876,7 @@ fn main() {
             }
         }
 
-        Commands::ReadSave { output } => {
+        Commands::ReadSave { output, no_rtc } => {
             let mut device = open_device();
             let info = read_cart_info(device.as_mut());
 
@@ -883,24 +889,41 @@ fn main() {
 
                     eprintln!("Reading save ({})...", format_size(info.ram_size));
 
-                    match device.read_save(
+                    let mut save = match device.read_save(
                         ChipType::Unknown,
                         info.rom_size,
                         info.ram_size,
                         &|cur| print_progress("Reading", cur, info.ram_size),
                     ) {
-                        Ok(save) => {
-                            fs::write(&output, &save).unwrap_or_else(|e| {
-                                eprintln!("Error writing file: {e}");
-                                process::exit(1);
-                            });
-                            eprintln!("Wrote {}.", output.display());
-                        }
+                        Ok(save) => save,
                         Err(e) => {
                             eprintln!("\nError: {e}");
                             process::exit(1);
                         }
+                    };
+
+                    // Bundle the clock into the .sav so it's a complete, emulator-
+                    // compatible backup (unless the cart has no RTC or --no-rtc).
+                    if info.has_rtc() && !no_rtc {
+                        match device.read_rtc(info.rom_size, info.ram_size) {
+                            Ok(payload) if payload.len() >= RTC_REGS_LEN => {
+                                append_rtc_trailer(&mut save, &payload);
+                                eprintln!("Appended RTC (48 bytes).");
+                            }
+                            Ok(_) => eprintln!(
+                                "Warning: RTC read returned too few bytes; wrote SRAM only."
+                            ),
+                            Err(e) => {
+                                eprintln!("Warning: couldn't read the RTC ({e}); wrote SRAM only.");
+                            }
+                        }
                     }
+
+                    fs::write(&output, &save).unwrap_or_else(|e| {
+                        eprintln!("Error writing file: {e}");
+                        process::exit(1);
+                    });
+                    eprintln!("Wrote {}.", output.display());
                 }
                 CartridgeType::GBA => {
                     eprintln!("Dumping ROM to detect save type...");
@@ -1000,7 +1023,7 @@ fn main() {
             }
         }
 
-        Commands::WriteSave { input, yes } => {
+        Commands::WriteSave { input, no_rtc, yes } => {
             let mut device = open_device();
             let info = read_cart_info(device.as_mut());
 
@@ -1021,23 +1044,50 @@ fn main() {
                         process::exit(1);
                     }
 
-                    if data.len() != info.ram_size as usize {
-                        eprintln!(
-                            "Warning: file size ({}) doesn't match cartridge RAM size ({}).",
-                            format_size(data.len() as u32),
-                            format_size(info.ram_size)
-                        );
-                    }
+                    // Split off any RTC bundled into the .sav (VBA-M/mGBA append it).
+                    let ram = info.ram_size as usize;
+                    let (sram, trailer): (&[u8], Option<&[u8]>) = match data.len().checked_sub(ram) {
+                        Some(0) => (&data, None),
+                        Some(n) if RTC_TRAILER_SIZES.contains(&n) => {
+                            (&data[..ram], Some(&data[ram..]))
+                        }
+                        _ => {
+                            eprintln!(
+                                "Warning: file size ({}) doesn't match cartridge RAM size ({}).",
+                                format_size(data.len() as u32),
+                                format_size(info.ram_size)
+                            );
+                            (&data, None)
+                        }
+                    };
 
-                    eprintln!("Writing save ({})...", format_size(data.len() as u32));
+                    eprintln!("Writing save ({})...", format_size(sram.len() as u32));
 
-                    match device.write_save(ChipType::Unknown, info.rom_size, &data, &|cur| {
-                        print_progress("Writing", cur, data.len() as u32);
+                    if let Err(e) = device.write_save(ChipType::Unknown, info.rom_size, sram, &|cur| {
+                        print_progress("Writing", cur, sram.len() as u32);
                     }) {
-                        Ok(()) => eprintln!("Save written."),
-                        Err(e) => {
-                            eprintln!("\nError: {e}");
-                            process::exit(1);
+                        eprintln!("\nError: {e}");
+                        process::exit(1);
+                    }
+                    eprintln!("Save written.");
+
+                    // Restore a bundled clock if present and the cart can hold one.
+                    if let Some(trailer) = trailer
+                        && !no_rtc
+                    {
+                        if !info.has_rtc() {
+                            eprintln!(
+                                "Note: this save includes a real-time clock, but the cartridge \
+                                 has no RTC; skipped the clock."
+                            );
+                        } else if let Some(rtc) = cartridge::RtcData::parse(trailer) {
+                            eprintln!("Writing bundled RTC...");
+                            match device.write_rtc(info.rom_size, info.ram_size, &rtc.to_payload()) {
+                                Ok(()) => eprintln!("RTC written ({rtc})."),
+                                Err(e) => eprintln!("Warning: couldn't write the RTC ({e})."),
+                            }
+                        } else {
+                            eprintln!("Warning: couldn't parse the bundled RTC; skipped the clock.");
                         }
                     }
                 }
@@ -1237,7 +1287,7 @@ fn main() {
             force,
         ),
 
-        Commands::ReadCamera { output, from, framed, rom, scaling } => {
+        Commands::ReadPhotos { output, from, framed, rom, scaling } => {
             // Acquire the 128 KB SRAM (and, for --framed, the camera ROM) from
             // either supplied files or the cartridge.
             let (save, rom_data): (Vec<u8>, Option<Vec<u8>>) = match from {
@@ -1348,7 +1398,7 @@ fn main() {
             eprintln!("Wrote {} photo(s) to {}.", slots.len(), output.display());
         }
 
-        Commands::WriteCamera { image, from, output, slot, frame, no_dither, yes } => {
+        Commands::WritePhoto { image, from, output, slot, frame, no_dither, yes } => {
             let pixels = load_camera_image(&image, !no_dither).unwrap_or_else(|e| {
                 eprintln!("Error reading image: {e}");
                 process::exit(1);
@@ -1533,6 +1583,24 @@ fn main() {
             }
         }
     }
+}
+
+/// RTC trailer lengths we accept on restore: 40 = throwback's own register-only block,
+/// 44 = old VBA (32-bit timestamp), 48 = VBA-M/mGBA (64-bit timestamp). We always
+/// *write* the 48-byte form (`cartridge.rs` register payload + a 64-bit unix timestamp).
+const RTC_TRAILER_SIZES: [usize; 3] = [40, 44, 48];
+const RTC_REGS_LEN: usize = 40;
+
+/// Append the 48-byte emulator RTC trailer to a GB save: the 40-byte register payload
+/// (current + latched, as the device returns it) plus a 64-bit little-endian unix
+/// timestamp, matching the VBA-M/mGBA `.sav` format.
+fn append_rtc_trailer(save: &mut Vec<u8>, payload: &[u8]) {
+    save.extend_from_slice(&payload[..RTC_REGS_LEN]);
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    save.extend_from_slice(&ts.to_le_bytes());
 }
 
 /// Exit with a clear message unless the cartridge is a GB cart with an RTC.

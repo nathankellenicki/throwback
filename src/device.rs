@@ -277,7 +277,7 @@ impl Serial {
         progress: &dyn Fn(u32),
     ) -> Result<Vec<u8>, DeviceError> {
         // Clear any stale bytes (e.g. a trailing frame from a prior read_save) so the
-        // 512-byte lead-in stays aligned when ops are chained (read-camera --framed).
+        // 512-byte lead-in stays aligned when ops are chained (read-photos --framed).
         self.flush_input();
         let packet = build_command(CMD_READ_GAME, chip, rom_size, save_size);
         self.send(&packet)?;
@@ -326,7 +326,7 @@ impl Serial {
             progress(save.len() as u32);
         }
 
-        // Consume the trailing DONE frame + padding so a chained op (e.g. read-camera
+        // Consume the trailing DONE frame + padding so a chained op (e.g. read-photos
         // --framed reads the save then the ROM) doesn't desync on leftover bytes.
         let _ = self.read_until_timeout();
         Ok(save)
