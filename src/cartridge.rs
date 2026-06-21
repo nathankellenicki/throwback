@@ -568,6 +568,154 @@ pub fn decode_camera_photo(save: &[u8], slot: usize) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// 8-bit additive sum + 8-bit XOR over `data`, from the given seeds. Returns
+/// `[sum, xor]` in the order the camera stores them (sum at the lower address).
+fn camera_checksum(data: &[u8], mut sum: u8, mut xor: u8) -> [u8; 2] {
+    for &b in data {
+        sum = sum.wrapping_add(b);
+        xor ^= b;
+    }
+    [sum, xor]
+}
+
+/// GB Camera metadata/directory block checksum: seeds 0x2F (sum) / 0x15 (xor) over
+/// the block's data bytes (the trailing 5-byte "Magic" marker is *not* included).
+/// Verified byte-exact against every photo slot of a real camera save.
+pub fn gb_camera_checksum(data: &[u8]) -> [u8; 2] {
+    camera_checksum(data, 0x2F, 0x15)
+}
+
+/// GB Camera per-image checksum (stored at slot+0xF34): an unseeded sum + XOR over
+/// the 0xE00-byte image tile data. Verified against a real camera save.
+pub fn gb_camera_image_checksum(image_tiles: &[u8]) -> [u8; 2] {
+    camera_checksum(image_tiles, 0x00, 0x00)
+}
+
+/// Map an 8-bit grayscale value to the nearest GB Camera 2bpp shade index (0..=3).
+fn nearest_shade(px: u8) -> u8 {
+    let mut best = 0u8;
+    let mut best_dist = i32::MAX;
+    for (value, &shade) in CAM_SHADES.iter().enumerate() {
+        let dist = (px as i32 - shade as i32).abs();
+        if dist < best_dist {
+            best_dist = dist;
+            best = value as u8;
+        }
+    }
+    best
+}
+
+/// Encode a 128×112 row-major 8-bit grayscale image into the GB Camera photo tile
+/// data (224 tiles, 16×14, 2bpp, 16 bytes/tile). The inverse of
+/// [`decode_camera_photo`]: pixels are mapped to the nearest of the four camera
+/// shades. Returns `0xE00` bytes.
+pub fn encode_camera_photo(pixels: &[u8]) -> Vec<u8> {
+    encode_tiles(pixels, CAMERA_PHOTO_WIDTH, CAMERA_PHOTO_HEIGHT)
+}
+
+/// Encode a row-major grayscale image of `width`×`height` (both multiples of 8)
+/// into GB 2bpp tiles in reading order (row-major tiles). 16 bytes per tile.
+fn encode_tiles(pixels: &[u8], width: usize, height: usize) -> Vec<u8> {
+    let tiles_w = width / 8;
+    let tiles_h = height / 8;
+    let mut out = vec![0u8; tiles_w * tiles_h * 16];
+    for t in 0..tiles_w * tiles_h {
+        let (tcol, trow) = (t % tiles_w, t / tiles_w);
+        for r in 0..8 {
+            let (mut lo, mut hi) = (0u8, 0u8);
+            for c in 0..8 {
+                let x = tcol * 8 + c;
+                let y = trow * 8 + r;
+                let v = nearest_shade(pixels[y * width + x]);
+                let bit = 7 - c;
+                lo |= (v & 1) << bit;
+                hi |= ((v >> 1) & 1) << bit;
+            }
+            out[t * 16 + r * 2] = lo;
+            out[t * 16 + r * 2 + 1] = hi;
+        }
+    }
+    out
+}
+
+/// Downscale a 128×112 image to the 32×32 thumbnail by sampling (cosmetic only —
+/// the thumbnail is not checksummed, so the camera accepts any 32×32). Row-major.
+fn downscale_thumbnail(image: &[u8]) -> Vec<u8> {
+    let (sw, sh) = (CAMERA_PHOTO_WIDTH, CAMERA_PHOTO_HEIGHT);
+    let (tw, th) = (32usize, 32usize);
+    let mut out = vec![0u8; tw * th];
+    for ty in 0..th {
+        for tx in 0..tw {
+            out[ty * tw + tx] = image[(ty * sh / th) * sw + (tx * sw / tw)];
+        }
+    }
+    out
+}
+
+/// Inject a 128×112 grayscale photo into a 128 KB GB Camera SRAM image at `slot`,
+/// writing the image tiles, thumbnail, metadata (with the per-image and block
+/// checksums and "Magic"), the metadata echo, and updating the album directory
+/// (value + checksum + echo) so a real Game Boy Camera shows it. Pixels are mapped
+/// to the four camera shades; `frame` is the border index.
+///
+/// Inject into a copy of a *real* camera save so owner data and other photos are
+/// preserved; metadata is templated from an existing photo when one is present.
+/// All offsets/checksums verified against a real camera save.
+pub fn inject_camera_photo(
+    save: &mut [u8],
+    slot: usize,
+    image: &[u8],
+    frame: u8,
+) -> Result<(), &'static str> {
+    if save.len() < CAM_SLOT0_OFFSET + 30 * CAM_SLOT_SIZE {
+        return Err("save is not a 128 KB GB Camera SRAM image");
+    }
+    if slot >= 30 {
+        return Err("slot out of range (0..=29)");
+    }
+    if image.len() != CAMERA_PHOTO_WIDTH * CAMERA_PHOTO_HEIGHT {
+        return Err("image must be 128x112 pixels");
+    }
+    let base = CAM_SLOT0_OFFSET + slot * CAM_SLOT_SIZE;
+
+    // Image + thumbnail.
+    let tiles = encode_camera_photo(image);
+    save[base..base + 0xE00].copy_from_slice(&tiles);
+    let thumb = encode_tiles(&downscale_thumbnail(image), 32, 32);
+    save[base + 0xE00..base + 0xF00].copy_from_slice(&thumb);
+
+    // 92-byte metadata block: template from an existing photo (for owner data etc.),
+    // otherwise leave zeroed.
+    let mut meta = [0u8; 0x5C];
+    if let Some(t) = camera_photo_slots(save).into_iter().find(|&s| s != slot) {
+        let tb = CAM_SLOT0_OFFSET + t * CAM_SLOT_SIZE + 0xF00;
+        meta.copy_from_slice(&save[tb..tb + 0x5C]);
+    }
+    meta[0x34..0x36].copy_from_slice(&gb_camera_image_checksum(&tiles)); // per-image crc
+    meta[0x54] = frame;
+    meta[0x55..0x5A].copy_from_slice(b"Magic");
+    let block_crc = gb_camera_checksum(&meta[..0x55]); // 85 data bytes, Magic excluded
+    meta[0x5A..0x5C].copy_from_slice(&block_crc);
+    save[base + 0xF00..base + 0xF5C].copy_from_slice(&meta);
+    save[base + 0xF5C..base + 0xF5C + 0x5C].copy_from_slice(&meta); // echo
+
+    // Directory: append this slot at the next album position, refresh Magic + checksum + echo.
+    let position = save[CAM_DIR_OFFSET..CAM_DIR_OFFSET + 30]
+        .iter()
+        .enumerate()
+        .filter(|&(i, &b)| i != slot && b != 0xFF)
+        .count() as u8;
+    save[CAM_DIR_OFFSET + slot] = position;
+    save[0x11D0..0x11D5].copy_from_slice(b"Magic");
+    let dir_crc = gb_camera_checksum(&save[CAM_DIR_OFFSET..CAM_DIR_OFFSET + 30]);
+    save[0x11D5..0x11D7].copy_from_slice(&dir_crc);
+    // Directory echo: the full 37-byte block (30 dir + 5 Magic + 2 crc).
+    let dir_block = save[CAM_DIR_OFFSET..CAM_DIR_OFFSET + 37].to_vec();
+    save[0x11D7..0x11D7 + 37].copy_from_slice(&dir_block);
+
+    Ok(())
+}
+
 /// Scale a row-major 8-bit image by an integer factor through literal pixel
 /// duplication: each source pixel becomes a `factor`×`factor` block of the same
 /// value. There is no interpolation, so the output contains only the pixel values

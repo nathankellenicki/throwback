@@ -115,6 +115,29 @@ enum Commands {
         #[arg(long, value_parser = parse_scaling, default_value = "10x")]
         scaling: u32,
     },
+    /// Inject a PNG as a new photo into a Game Boy Camera (cartridge or save file)
+    WriteCamera {
+        /// PNG to inject (any size/colour; converted to the camera's 128x112 4-shade format)
+        image: PathBuf,
+        /// Inject into this camera save file instead of the inserted cartridge
+        #[arg(long)]
+        from: Option<PathBuf>,
+        /// Output save path (required with --from)
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+        /// Target photo slot 0..=29 (default: the first free slot)
+        #[arg(long)]
+        slot: Option<usize>,
+        /// Border/frame index stored with the photo
+        #[arg(long, default_value_t = 0)]
+        frame: u8,
+        /// Map each pixel to the nearest shade instead of dithering (better for logos/line art)
+        #[arg(long)]
+        no_dither: bool,
+        /// Cart mode: write back to the cartridge without the confirmation prompt
+        #[arg(long)]
+        write: bool,
+    },
     /// Read the cartridge's real-time clock (MBC3 carts)
     ReadRtc {
         /// Optional file to save the raw 40-byte RTC payload as a backup
@@ -521,6 +544,104 @@ fn parse_scaling(s: &str) -> Result<u32, String> {
         return Err("scaling must be at most 1000x".to_string());
     }
     Ok(factor)
+}
+
+/// Load a PNG and convert it to a 128×112 image for the Game Boy Camera: greyscale,
+/// box-averaged down to camera resolution, then reduced to the four camera shades —
+/// Floyd–Steinberg dithered when `dither` is set (good for photos), otherwise mapped
+/// straight to the nearest shade (good for logos/line art).
+fn load_camera_image(path: &Path, dither: bool) -> Result<Vec<u8>, String> {
+    let file = fs::File::open(path).map_err(|e| format!("open image: {e}"))?;
+    let mut decoder = png::Decoder::new(file);
+    decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
+    let mut reader = decoder.read_info().map_err(|e| format!("read PNG: {e}"))?;
+    let mut buf = vec![0u8; reader.output_buffer_size()];
+    let info = reader.next_frame(&mut buf).map_err(|e| format!("decode PNG: {e}"))?;
+    let (sw, sh) = (info.width as usize, info.height as usize);
+    if sw == 0 || sh == 0 {
+        return Err("image has zero dimensions".to_string());
+    }
+    let channels = match info.color_type {
+        png::ColorType::Grayscale => 1,
+        png::ColorType::GrayscaleAlpha => 2,
+        png::ColorType::Rgb => 3,
+        png::ColorType::Rgba => 4,
+        png::ColorType::Indexed => return Err("indexed PNGs aren't supported".to_string()),
+    };
+    let data = &buf[..info.buffer_size()];
+    let luma = |x: usize, y: usize| -> u32 {
+        let i = (y * sw + x) * channels;
+        match channels {
+            1 | 2 => data[i] as u32,
+            _ => (data[i] as u32 * 299 + data[i + 1] as u32 * 587 + data[i + 2] as u32 * 114) / 1000,
+        }
+    };
+
+    let (tw, th) = (cartridge::CAMERA_PHOTO_WIDTH, cartridge::CAMERA_PHOTO_HEIGHT);
+    // Box-average downscale to camera resolution.
+    let mut gray = vec![0i32; tw * th];
+    for ty in 0..th {
+        let (y0, y1) = (ty * sh / th, (((ty + 1) * sh / th).max(ty * sh / th + 1)).min(sh));
+        for tx in 0..tw {
+            let (x0, x1) = (tx * sw / tw, (((tx + 1) * sw / tw).max(tx * sw / tw + 1)).min(sw));
+            let (mut sum, mut n) = (0u32, 0u32);
+            for y in y0..y1 {
+                for x in x0..x1 {
+                    sum += luma(x, y);
+                    n += 1;
+                }
+            }
+            gray[ty * tw + tx] = (sum / n.max(1)) as i32;
+        }
+    }
+
+    // Reduce to the four GB Camera shades.
+    let shades = [0i32, 0x54, 0xA8, 0xFF];
+    let nearest = |v: i32| *shades.iter().min_by_key(|&&s| (v - s).abs()).unwrap();
+    let mut out = vec![0u8; tw * th];
+    if dither {
+        // Floyd–Steinberg: snap to nearest shade, diffuse the error to neighbours.
+        for y in 0..th {
+            for x in 0..tw {
+                let old = gray[y * tw + x].clamp(0, 255);
+                let newv = nearest(old);
+                out[y * tw + x] = newv as u8;
+                let err = old - newv;
+                let mut spread = |xx: usize, yy: usize, f: i32| gray[yy * tw + xx] += err * f / 16;
+                if x + 1 < tw {
+                    spread(x + 1, y, 7);
+                }
+                if y + 1 < th {
+                    if x > 0 {
+                        spread(x - 1, y + 1, 3);
+                    }
+                    spread(x, y + 1, 5);
+                    if x + 1 < tw {
+                        spread(x + 1, y + 1, 1);
+                    }
+                }
+            }
+        }
+    } else {
+        // Plain thresholding: each pixel to its nearest shade.
+        for (o, &g) in out.iter_mut().zip(gray.iter()) {
+            *o = nearest(g.clamp(0, 255)) as u8;
+        }
+    }
+    Ok(out)
+}
+
+/// Pick the camera slot to write: the requested one, or the first free slot.
+fn pick_camera_slot(save: &[u8], requested: Option<usize>) -> usize {
+    if let Some(s) = requested {
+        return s;
+    }
+    (0..30)
+        .find(|&s| save.get(0x11B2 + s) == Some(&0xFF))
+        .unwrap_or_else(|| {
+            eprintln!("The camera is full (30 photos). Pass --slot to overwrite one.");
+            process::exit(1);
+        })
 }
 
 /// Write an 8-bit grayscale buffer as a PNG.
@@ -1188,6 +1309,86 @@ fn main() {
                 }
             }
             eprintln!("Saved {} photo(s) to {}", slots.len(), output.display());
+        }
+
+        Commands::WriteCamera { image, from, output, slot, frame, no_dither, write } => {
+            let pixels = load_camera_image(&image, !no_dither).unwrap_or_else(|e| {
+                eprintln!("Error reading image: {e}");
+                process::exit(1);
+            });
+
+            match from {
+                // File mode: inject into a copy of an existing camera save.
+                Some(base) => {
+                    let Some(out) = output else {
+                        eprintln!("--from requires -o <output save>.");
+                        process::exit(1);
+                    };
+                    let mut save = fs::read(&base).unwrap_or_else(|e| {
+                        eprintln!("Error reading save: {e}");
+                        process::exit(1);
+                    });
+                    let slot = pick_camera_slot(&save, slot);
+                    cartridge::inject_camera_photo(&mut save, slot, &pixels, frame).unwrap_or_else(|e| {
+                        eprintln!("Error injecting photo: {e}");
+                        process::exit(1);
+                    });
+                    fs::write(&out, &save).unwrap_or_else(|e| {
+                        eprintln!("Error writing output: {e}");
+                        process::exit(1);
+                    });
+                    println!("Injected {} into slot {slot}; wrote {}", image.display(), out.display());
+                }
+                // Cart mode: read the camera's save, inject, write it back.
+                None => {
+                    let mut device = open_device();
+                    let info = read_cart_info(device.as_mut());
+                    if info.mbc_type != cartridge::MBC_POCKET_CAMERA {
+                        eprintln!(
+                            "This is not a Game Boy Camera cartridge (MBC: {} 0x{:02X}).",
+                            info.mbc_name(),
+                            info.mbc_type
+                        );
+                        process::exit(1);
+                    }
+                    eprintln!("Reading camera save ({})...", format_size(info.ram_size));
+                    let mut save = device
+                        .read_save(ChipType::Unknown, info.rom_size, info.ram_size, &|cur| {
+                            print_progress("Reading", cur, info.ram_size)
+                        })
+                        .unwrap_or_else(|e| {
+                            eprintln!("\nError: {e}");
+                            process::exit(1);
+                        });
+
+                    let slot = pick_camera_slot(&save, slot);
+                    cartridge::inject_camera_photo(&mut save, slot, &pixels, frame).unwrap_or_else(|e| {
+                        eprintln!("Error injecting photo: {e}");
+                        process::exit(1);
+                    });
+
+                    if !write
+                        && !confirm(&format!(
+                            "Write {} into slot {slot} on the camera? This overwrites its save.",
+                            image.display()
+                        ))
+                    {
+                        eprintln!("Aborted.");
+                        process::exit(1);
+                    }
+
+                    eprintln!("Writing camera save ({})...", format_size(save.len() as u32));
+                    device
+                        .write_save(ChipType::Unknown, info.rom_size, &save, &|cur| {
+                            print_progress("Writing", cur, save.len() as u32)
+                        })
+                        .unwrap_or_else(|e| {
+                            eprintln!("\nError: {e}");
+                            process::exit(1);
+                        });
+                    eprintln!("Injected {} into slot {slot} on the camera.", image.display());
+                }
+            }
         }
 
         Commands::ReadRtc { output } => {

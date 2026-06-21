@@ -666,3 +666,75 @@ fn scale_block_introduces_no_new_values() {
     assert!(out.iter().all(|&v| v == 0 || v == 255));
     assert_eq!(out.len(), 8 * 8);
 }
+
+#[test]
+fn gb_camera_checksum_seeds_and_accumulation() {
+    // Empty data = the bare seeds (sum 0x2F, xor 0x15).
+    assert_eq!(gb_camera_checksum(&[]), [0x2F, 0x15]);
+    // One byte: sum 0x2F+0x01, xor 0x15^0x01.
+    assert_eq!(gb_camera_checksum(&[0x01]), [0x30, 0x14]);
+    // A couple of bytes, hand-computed.
+    assert_eq!(gb_camera_checksum(&[0x10, 0x20]), [0x2F + 0x30, 0x15 ^ 0x10 ^ 0x20]);
+}
+
+#[test]
+fn encode_camera_photo_round_trips_through_decode() {
+    // An image using only the four camera shades, varied across the frame.
+    let (w, h) = (CAMERA_PHOTO_WIDTH, CAMERA_PHOTO_HEIGHT);
+    let shades = [0xFFu8, 0xA8, 0x54, 0x00];
+    let img: Vec<u8> = (0..w * h).map(|i| shades[(i / 8 + i / w) % 4]).collect();
+
+    let tiles = encode_camera_photo(&img);
+    assert_eq!(tiles.len(), 0xE00);
+
+    // Drop the tiles into slot 0 of a save and decode them back.
+    let mut save = vec![0u8; 0x20000];
+    save[0x2000..0x2000 + tiles.len()].copy_from_slice(&tiles);
+    assert_eq!(decode_camera_photo(&save, 0).unwrap(), img);
+}
+
+#[test]
+fn inject_camera_photo_into_real_save() {
+    // Validates the injector against a genuine Game Boy Camera save if present.
+    let path = std::path::Path::new("tests/camera/camera.sav");
+    if !path.exists() {
+        eprintln!("skipping: no real camera save at tests/camera/camera.sav");
+        return;
+    }
+    let mut save = std::fs::read(path).unwrap();
+    let before = camera_photo_slots(&save);
+
+    // A synthetic image using only the four camera shades.
+    let (w, h) = (CAMERA_PHOTO_WIDTH, CAMERA_PHOTO_HEIGHT);
+    let shades = [0xFFu8, 0xA8, 0x54, 0x00];
+    let img: Vec<u8> = (0..w * h).map(|i| shades[(i / 8 + i / w) % 4]).collect();
+
+    let slot = (0..30).find(|&s| save[0x11B2 + s] == 0xFF).expect("a free slot");
+    inject_camera_photo(&mut save, slot, &img, 0).unwrap();
+
+    // Directory: the new slot is appended in display order, count +1.
+    let after = camera_photo_slots(&save);
+    assert_eq!(after.len(), before.len() + 1);
+    assert_eq!(*after.last().unwrap(), slot);
+
+    // The image decodes back exactly.
+    assert_eq!(decode_camera_photo(&save, slot).unwrap(), img);
+
+    let base = 0x2000 + slot * 0x1000;
+    // Block checksum (85 data bytes, Magic excluded) matches what was stored.
+    assert_eq!(
+        gb_camera_checksum(&save[base + 0xF00..base + 0xF55]),
+        [save[base + 0xF5A], save[base + 0xF5B]]
+    );
+    // Per-image checksum over the 0xE00 image tiles.
+    assert_eq!(
+        gb_camera_image_checksum(&save[base..base + 0xE00]),
+        [save[base + 0xF34], save[base + 0xF35]]
+    );
+    // "Magic" present; metadata echo mirrors the block.
+    assert_eq!(&save[base + 0xF55..base + 0xF5A], b"Magic");
+    assert_eq!(&save[base + 0xF00..base + 0xF5C], &save[base + 0xF5C..base + 0xF5C + 0x5C]);
+    // Directory checksum + echo valid.
+    assert_eq!(gb_camera_checksum(&save[0x11B2..0x11B2 + 30]), [save[0x11D5], save[0x11D6]]);
+    assert_eq!(&save[0x11B2..0x11B2 + 37], &save[0x11D7..0x11D7 + 37]);
+}

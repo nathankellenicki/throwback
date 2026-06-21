@@ -2,7 +2,7 @@
 
 A CLI for working with Epilogue's GB Operator and SN Operator.
 
-It dumps ROMs, backs up and restores saves, reads and sets the real-time clock on Pokémon carts, pulls the photos off a Game Boy Camera, writes ROMs to flash carts, applies IPS, UPS, and BPS patches, and updates games to their latest version.
+It dumps ROMs, backs up and restores saves, reads and sets the real-time clock on Pokémon carts, pulls the photos off a Game Boy Camera and puts new ones on, writes ROMs to flash carts, applies IPS, UPS, and BPS patches, and updates games to their latest version.
 
 Throwback is an independent project. It talks to the Operator hardware over USB but is not affiliated with Epilogue.
 
@@ -137,6 +137,26 @@ You can also decode a save file you already have instead of reading the cart. Wi
 throwback read-camera photos/ --from camera.sav
 throwback read-camera photos/ --from camera.sav --framed --rom camera.gb
 ```
+
+### write-camera
+
+Put a new photo onto a Game Boy Camera. Give it a PNG and, with the camera in the Operator:
+
+```
+throwback write-camera test.png
+```
+
+Throwback converts the image to the camera's format (greyscale, 128×112, dithered to the four camera shades), adds it to the first free slot, and writes the save back once you confirm by typing `y`. Your existing photos are kept, and the new one shows up in the gallery and prints like any other.
+
+Any PNG works, but it's stretched to fit 128×112 (an 8:7 ratio) with no cropping, so resize and adjust brightness and contrast in an editor of your choice first for the best result. Dithering (the default) looks best for photos; for logos or line art, `--no-dither` maps each pixel straight to the nearest shade. `--slot` picks the slot, `--frame` sets the border, and `--write` skips the confirmation.
+
+To build a save file instead of writing to the cartridge:
+
+```
+throwback write-camera test.png --from camera.sav -o camera_new.sav
+```
+
+Write the result to the cart later with `write-save`.
 
 ### write-rom
 
