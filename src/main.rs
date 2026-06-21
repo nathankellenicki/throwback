@@ -53,6 +53,9 @@ enum Commands {
     WriteSave {
         /// Input file path
         input: PathBuf,
+        /// Skip the confirmation prompt
+        #[arg(short, long)]
+        yes: bool,
     },
     /// Write ROM to a flash cart
     WriteRom {
@@ -61,33 +64,41 @@ enum Commands {
         /// Write even if the cartridge isn't detected as a writeable flashcart
         #[arg(long)]
         force: bool,
-    },
-    /// Apply an IPS, UPS, or BPS patch to a ROM file
-    ApplyPatch {
-        /// Source ROM file
-        rom: PathBuf,
-        /// IPS patch file
-        patch: PathBuf,
-        /// Output patched ROM file
+        /// Skip the confirmation prompt
         #[arg(short, long)]
-        output: PathBuf,
-        /// Write even if the patched ROM fails header-checksum validation
+        yes: bool,
+    },
+    /// Apply an IPS, UPS, or BPS patch to a ROM (file or the inserted cart)
+    ApplyPatch {
+        /// IPS, UPS, or BPS patch file
+        patch: PathBuf,
+        /// Source ROM file; omit to read the inserted cartridge
+        #[arg(long)]
+        from: Option<PathBuf>,
+        /// Output ROM path; omit to flash the result to the inserted cartridge
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+        /// Write/flash even if the patched ROM fails checksum validation
         #[arg(long)]
         ignore_checksum: bool,
+        /// Cart mode: flash even if the cart isn't a detected writeable flashcart
+        #[arg(long)]
+        force: bool,
+        /// Cart mode: skip the confirmation prompt
+        #[arg(short, long)]
+        yes: bool,
     },
     /// Check update services for a newer version of a ROM (or the inserted cart) and apply it
     Upgrade {
-        /// ROM file to upgrade; omit to read and upgrade the inserted cartridge
-        rom: Option<PathBuf>,
-        /// Output ROM path (defaults to "<title> <version>.<ext>" next to the input)
+        /// ROM file to upgrade; omit to read the inserted cartridge
+        #[arg(long)]
+        from: Option<PathBuf>,
+        /// Output ROM path; omit to flash the upgrade to the inserted cartridge
         #[arg(short, long)]
         output: Option<PathBuf>,
         /// Report available updates without applying or flashing anything
         #[arg(long)]
         check: bool,
-        /// Cart mode: flash without the interactive confirmation
-        #[arg(long)]
-        write: bool,
         /// Proceed past a save-incompatible update without the interactive prompt
         #[arg(long)]
         acknowledge_incompatible_save: bool,
@@ -97,6 +108,9 @@ enum Commands {
         /// Cart mode: flash even if the cart isn't a detected writeable flashcart
         #[arg(long)]
         force: bool,
+        /// Cart mode: skip the confirmation prompt
+        #[arg(short, long)]
+        yes: bool,
     },
     /// Extract photos from a Game Boy Camera cartridge (or a camera .sav)
     ReadCamera {
@@ -117,12 +131,12 @@ enum Commands {
     },
     /// Inject a PNG as a new photo into a Game Boy Camera (cartridge or save file)
     WriteCamera {
-        /// PNG to inject (any size/colour; converted to the camera's 128x112 4-shade format)
+        /// PNG to inject (any size/color; converted to the camera's 128x112 4-shade format)
         image: PathBuf,
-        /// Inject into this camera save file instead of the inserted cartridge
+        /// Camera save file to inject into; omit to read the inserted cartridge
         #[arg(long)]
         from: Option<PathBuf>,
-        /// Output save path (required with --from)
+        /// Output save path; omit to write the result back to the inserted cartridge
         #[arg(short, long)]
         output: Option<PathBuf>,
         /// Target photo slot 0..=29 (default: the first free slot)
@@ -134,29 +148,36 @@ enum Commands {
         /// Map each pixel to the nearest shade instead of dithering (better for logos/line art)
         #[arg(long)]
         no_dither: bool,
-        /// Cart mode: write back to the cartridge without the confirmation prompt
-        #[arg(long)]
-        write: bool,
+        /// Cart mode: skip the confirmation prompt
+        #[arg(short, long)]
+        yes: bool,
     },
     /// Read the cartridge's real-time clock (MBC3 carts)
     ReadRtc {
         /// Optional file to save the raw 40-byte RTC payload as a backup
-        #[arg(long)]
+        #[arg(short, long)]
         output: Option<PathBuf>,
     },
     /// Write the cartridge's real-time clock (MBC3 carts)
     WriteRtc {
         /// Restore from a raw 40-byte .rtc backup (takes precedence over the flags)
         #[arg(long)]
-        input: Option<PathBuf>,
+        from: Option<PathBuf>,
+        /// Day counter to set
         #[arg(long, default_value_t = 0)]
         days: u16,
+        /// Hours to set (0-23)
         #[arg(long, default_value_t = 0)]
         hours: u8,
+        /// Minutes to set (0-59)
         #[arg(long, default_value_t = 0)]
         minutes: u8,
+        /// Seconds to set (0-59)
         #[arg(long, default_value_t = 0)]
         seconds: u8,
+        /// Skip the confirmation prompt
+        #[arg(short, long)]
+        yes: bool,
     },
 }
 
@@ -199,12 +220,73 @@ fn print_progress(label: &str, current: u32, total: u32) {
     }
 }
 
-fn apply_patch(rom_path: &PathBuf, patch_path: &PathBuf, output: &PathBuf, ignore_checksum: bool) {
-    let rom = fs::read(rom_path).unwrap_or_else(|e| {
-        eprintln!("Error reading ROM: {e}");
-        process::exit(1);
-    });
+/// Device + cart info, opened when the cartridge is the source or destination.
+struct CartHandle {
+    device: Box<dyn CartridgeDevice>,
+    info: CartridgeInfo,
+}
 
+/// Open the device when the cartridge is needed on either end (source or destination).
+/// When both `from` and `output` are files the operation is entirely offline, so this
+/// returns `None` and never touches the hardware.
+fn open_if_cart(from: Option<&Path>, output: Option<&Path>) -> Option<CartHandle> {
+    if from.is_some() && output.is_some() {
+        return None;
+    }
+    let mut device = open_device();
+    let info = read_cart_info(device.as_mut());
+    Some(CartHandle { device, info })
+}
+
+/// Read the source ROM from a file, or dump it from the inserted cart.
+fn read_rom_source(from: Option<&Path>, handle: Option<&mut CartHandle>) -> Vec<u8> {
+    match from {
+        Some(p) => fs::read(p).unwrap_or_else(|e| {
+            eprintln!("Error reading ROM: {e}");
+            process::exit(1);
+        }),
+        None => {
+            let h = handle.expect("cart handle is opened when the source is the cartridge");
+            dump_cart_rom(h.device.as_mut(), &h.info)
+        }
+    }
+}
+
+/// Flashcart-writeable guard, pad to a 64-byte boundary, then flash. The caller is
+/// responsible for any confirmation prompt before calling this.
+fn flash_rom(handle: &mut CartHandle, rom: Vec<u8>, force: bool) {
+    if !force {
+        match handle.device.detect_flashcart() {
+            Ok(d) if !cartridge::flashcart_writeable(&d) => {
+                eprintln!(
+                    "Refusing to write: this cartridge is not a writeable flashcart (retail / mask ROM)."
+                );
+                eprintln!("Pass --force to override.");
+                process::exit(1);
+            }
+            _ => {}
+        }
+    }
+    let mut padded = rom;
+    if !padded.len().is_multiple_of(64) {
+        padded.resize(padded.len() + (64 - padded.len() % 64), 0xFF);
+    }
+    let ram_size = handle.info.ram_size;
+    eprintln!("Writing {} to the cartridge...", format_size(padded.len() as u32));
+    if let Err(e) = handle.device.write_rom(
+        &padded,
+        ram_size,
+        &|cur| print_progress("Writing", cur, padded.len() as u32),
+        &|msg| eprintln!("\r{msg}    "),
+    ) {
+        eprintln!("\nError: {e}");
+        process::exit(1);
+    }
+}
+
+/// Load + apply + verify a patch, returning the patched ROM. Verification messages are
+/// printed here; the caller decides where the result goes (file or cart).
+fn apply_patch_bytes(rom: Vec<u8>, patch_path: &Path, ignore_checksum: bool) -> Vec<u8> {
     let patch_data = fs::read(patch_path).unwrap_or_else(|e| {
         eprintln!("Error reading patch: {e}");
         process::exit(1);
@@ -216,7 +298,6 @@ fn apply_patch(rom_path: &PathBuf, patch_path: &PathBuf, output: &PathBuf, ignor
     });
 
     let format = patch.format_name();
-    let original_len = rom.len();
     // UPS/BPS verify the source ROM's CRC32 before applying (a mismatch is a hard
     // error unless --ignore-checksum). IPS has no such check and applies in place.
     let patched = patch.apply_into(rom, !ignore_checksum).unwrap_or_else(|e| {
@@ -235,7 +316,7 @@ fn apply_patch(rom_path: &PathBuf, patch_path: &PathBuf, output: &PathBuf, ignor
     }
 
     if ignore_checksum {
-        // verification skipped entirely below
+        // verification skipped entirely
     } else if patch.has_checksums() {
         // UPS/BPS already verified source and target CRC32 inside apply.
         eprintln!("{format} source and target checksums OK.");
@@ -255,22 +336,8 @@ fn apply_patch(rom_path: &PathBuf, patch_path: &PathBuf, output: &PathBuf, ignor
         }
     }
 
-    fs::write(output, &patched).unwrap_or_else(|e| {
-        eprintln!("Error writing output: {e}");
-        process::exit(1);
-    });
-
-    eprintln!("Applied {} to {}", patch_path.display(), rom_path.display());
-    eprintln!(
-        "Wrote {} ({} -> {} bytes)",
-        output.display(),
-        format_size(original_len as u32),
-        format_size(patched.len() as u32)
-    );
-
-    if ignore_checksum {
-        eprintln!("Warning: skipped checksum verification.");
-    }
+    eprintln!("Applied {} patch.", format);
+    patched
 }
 
 /// Run the service sweep over `rom` and report. Returns `Some((id, upgrade))` when a
@@ -322,74 +389,6 @@ fn print_update_summary(id: &Identity, up: &Upgrade) {
     }
 }
 
-/// Make a string safe to use as a filename.
-fn sanitize_filename(name: &str) -> String {
-    let s: String = name
-        .chars()
-        .map(|c| if c.is_alphanumeric() || " ._-()".contains(c) { c } else { '_' })
-        .collect();
-    let s = s.trim();
-    if s.is_empty() { "game".to_string() } else { s.to_string() }
-}
-
-/// Default output path for file mode: "<title> <version>.<ext>" next to the input.
-fn default_output_name(input: &Path, id: &Identity, up: &Upgrade) -> PathBuf {
-    let ext = input.extension().and_then(|e| e.to_str()).unwrap_or("gbc");
-    let name = format!("{} {}.{ext}", sanitize_filename(&id.title), up.to_version);
-    match input.parent() {
-        Some(p) if !p.as_os_str().is_empty() => p.join(name),
-        _ => PathBuf::from(name),
-    }
-}
-
-fn upgrade_file(path: &Path, output: Option<&Path>, check: bool, ignore_checksum: bool) {
-    let rom = fs::read(path).unwrap_or_else(|e| {
-        eprintln!("Error reading ROM: {e}");
-        process::exit(1);
-    });
-
-    let Some((id, up)) = resolve_update(&rom) else {
-        return;
-    };
-    print_update_summary(&id, &up);
-    if check {
-        return;
-    }
-    println!();
-
-    let upgraded = upgrade::produce_upgraded_rom(&up, rom, !ignore_checksum).unwrap_or_else(|e| {
-        eprintln!("Error applying update: {e}");
-        if !ignore_checksum {
-            eprintln!("Pass --ignore-checksum to bypass verification.");
-        }
-        process::exit(1);
-    });
-
-    let out_path = match output {
-        Some(p) => p.to_path_buf(),
-        None => default_output_name(path, &id, &up),
-    };
-    if out_path == path {
-        eprintln!("Refusing to overwrite the input ROM; pass -o <path> for the output.");
-        process::exit(1);
-    }
-
-    fs::write(&out_path, &upgraded).unwrap_or_else(|e| {
-        eprintln!("Error writing output: {e}");
-        process::exit(1);
-    });
-    println!(
-        "Upgraded {} {} -> {}; wrote {}",
-        id.title,
-        up.from_version,
-        up.to_version,
-        out_path.display()
-    );
-    if ignore_checksum {
-        eprintln!("Warning: skipped verification.");
-    }
-}
-
 /// Dump the inserted cart's ROM into memory (GBA is auto-trimmed), for the sweep.
 fn dump_cart_rom(device: &mut dyn CartridgeDevice, info: &CartridgeInfo) -> Vec<u8> {
     let mut read = |chip, size: u32, save| {
@@ -434,18 +433,27 @@ fn confirm(prompt: &str) -> bool {
     matches!(line.trim(), "y" | "Y" | "yes" | "Yes")
 }
 
+/// `upgrade`: source ROM from a file (`--from`) or the cart; result to a file (`-o`) or
+/// flashed back to the cart. With neither flag it reads and re-flashes the inserted cart.
 #[allow(clippy::fn_params_excessive_bools)]
-fn upgrade_cart(
+fn do_upgrade(
+    from: Option<&Path>,
     output: Option<&Path>,
     check: bool,
-    write: bool,
+    yes: bool,
     acknowledge_incompatible_save: bool,
     ignore_checksum: bool,
     force: bool,
 ) {
-    let mut device = open_device();
-    let info = read_cart_info(device.as_mut());
-    let rom = dump_cart_rom(device.as_mut(), &info);
+    if let (Some(o), Some(f)) = (output, from)
+        && o == f
+    {
+        eprintln!("Output is the same as the input; pass a different -o <path>.");
+        process::exit(1);
+    }
+
+    let mut handle = open_if_cart(from, output);
+    let rom = read_rom_source(from, handle.as_mut());
 
     let Some((id, up)) = resolve_update(&rom) else {
         return;
@@ -464,70 +472,57 @@ fn upgrade_cart(
         process::exit(1);
     });
 
-    // Keep a copy on disk if requested (written before flashing, so it survives even
-    // if the flash fails).
-    if let Some(out) = output {
-        fs::write(out, &upgraded).unwrap_or_else(|e| {
-            eprintln!("Error writing output: {e}");
-            process::exit(1);
-        });
-        eprintln!("Wrote {}", out.display());
-    }
-
-    // Save-incompatibility acknowledgement (only matters if the cart holds a save).
-    if up.save_compatible == Some(false) && info.ram_size > 0 && !acknowledge_incompatible_save {
-        eprintln!(
-            "This update is NOT save-compatible; the save on your cartridge may not carry over."
-        );
-        eprintln!("Back up the save first with `throwback read-save` if you want to keep it.");
-        if !confirm("Continue and flash anyway?") {
-            eprintln!("Aborted.");
-            process::exit(1);
+    match output {
+        // File destination: write and stop, no hardware involved.
+        Some(out) => {
+            fs::write(out, &upgraded).unwrap_or_else(|e| {
+                eprintln!("Error writing output: {e}");
+                process::exit(1);
+            });
+            eprintln!(
+                "Upgraded {} {} -> {}; wrote {}.",
+                id.title,
+                up.from_version,
+                up.to_version,
+                out.display()
+            );
         }
-    }
+        // Cart destination: acknowledge save incompatibility, confirm, then flash.
+        None => {
+            let h = handle.as_mut().expect("cart handle is opened when flashing");
 
-    // Flash confirmation.
-    if !write
-        && !confirm(&format!(
-            "Flash {} {} to the cartridge? This erases it.",
-            id.title, up.to_version
-        ))
-    {
-        eprintln!("Aborted.");
-        process::exit(1);
-    }
-
-    // Flashcart-writeable guard (same as write-rom).
-    if !force {
-        match device.detect_flashcart() {
-            Ok(d) if !cartridge::flashcart_writeable(&d) => {
+            // Save-incompatibility acknowledgement (only matters if the cart holds a save).
+            if up.save_compatible == Some(false)
+                && h.info.ram_size > 0
+                && !acknowledge_incompatible_save
+            {
                 eprintln!(
-                    "Refusing to write: this cartridge is not a writeable flashcart (retail / mask ROM)."
+                    "This update is NOT save-compatible; the save on your cartridge may not carry over."
                 );
-                eprintln!("Pass --force to override.");
+                eprintln!("Back up the save first with `throwback read-save` if you want to keep it.");
+                if !confirm("Continue and flash anyway?") {
+                    eprintln!("Aborted.");
+                    process::exit(1);
+                }
+            }
+
+            if !yes
+                && !confirm(&format!(
+                    "Flash {} {} to the cartridge? This erases it.",
+                    id.title, up.to_version
+                ))
+            {
+                eprintln!("Aborted.");
                 process::exit(1);
             }
-            _ => {}
+
+            flash_rom(h, upgraded, force);
+            eprintln!("Upgraded {} to {} on the cartridge.", id.title, up.to_version);
         }
     }
 
-    // Pad to a 64-byte boundary and flash.
-    let mut padded = upgraded;
-    if !padded.len().is_multiple_of(64) {
-        padded.resize(padded.len() + (64 - padded.len() % 64), 0xFF);
-    }
-    eprintln!("Writing {} to the cartridge...", format_size(padded.len() as u32));
-    match device.write_rom(
-        &padded,
-        info.ram_size,
-        &|cur| print_progress("Writing", cur, padded.len() as u32),
-        &|msg| eprintln!("\r{msg}    "),
-    ) {
-        Ok(()) => eprintln!("Upgraded {} to {} on the cartridge.", id.title, up.to_version),
-        Err(e) => {
-            eprintln!("\nError: {e}");
-            process::exit(1);
-        }
+    if ignore_checksum {
+        eprintln!("Warning: skipped verification.");
     }
 }
 
@@ -546,7 +541,7 @@ fn parse_scaling(s: &str) -> Result<u32, String> {
     Ok(factor)
 }
 
-/// Load a PNG and convert it to a 128×112 image for the Game Boy Camera: greyscale,
+/// Load a PNG and convert it to a 128×112 image for the Game Boy Camera: grayscale,
 /// box-averaged down to camera resolution, then reduced to the four camera shades —
 /// Floyd–Steinberg dithered when `dither` is set (good for photos), otherwise mapped
 /// straight to the nearest shade (good for logos/line art).
@@ -671,7 +666,7 @@ fn dump_rom_gb(device: &mut dyn CartridgeDevice, info: &CartridgeInfo, output: &
                 eprintln!("Error writing file: {e}");
                 process::exit(1);
             });
-            eprintln!("Saved to {}", output.display());
+            eprintln!("Wrote {}.", output.display());
         }
         Err(e) => {
             eprintln!("\nError: {e}");
@@ -702,7 +697,7 @@ fn dump_rom_gba(device: &mut dyn CartridgeDevice, _info: &CartridgeInfo, output:
                 eprintln!("Error writing file: {e}");
                 process::exit(1);
             });
-            eprintln!("Saved to {}", output.display());
+            eprintln!("Wrote {}.", output.display());
         }
         Err(e) => {
             eprintln!("\nError: {e}");
@@ -757,7 +752,7 @@ fn dump_rom_snes(device: &mut dyn CartridgeDevice, info: &CartridgeInfo, output:
         eprintln!("Error writing file: {e}");
         process::exit(1);
     });
-    eprintln!("Saved to {}", output.display());
+    eprintln!("Wrote {}.", output.display());
 }
 
 fn main() {
@@ -899,7 +894,7 @@ fn main() {
                                 eprintln!("Error writing file: {e}");
                                 process::exit(1);
                             });
-                            eprintln!("Saved to {}", output.display());
+                            eprintln!("Wrote {}.", output.display());
                         }
                         Err(e) => {
                             eprintln!("\nError: {e}");
@@ -953,7 +948,7 @@ fn main() {
                                 eprintln!("Error writing file: {e}");
                                 process::exit(1);
                             });
-                            eprintln!("Saved to {}", output.display());
+                            eprintln!("Wrote {}.", output.display());
                         }
                         Err(e) => {
                             eprintln!("\nError: {e}");
@@ -994,7 +989,7 @@ fn main() {
                                 eprintln!("Error writing file: {e}");
                                 process::exit(1);
                             });
-                            eprintln!("Saved to {}", output.display());
+                            eprintln!("Wrote {}.", output.display());
                         }
                         Err(e) => {
                             eprintln!("\nError: {e}");
@@ -1005,7 +1000,7 @@ fn main() {
             }
         }
 
-        Commands::WriteSave { input } => {
+        Commands::WriteSave { input, yes } => {
             let mut device = open_device();
             let info = read_cart_info(device.as_mut());
 
@@ -1013,6 +1008,11 @@ fn main() {
                 eprintln!("Error reading file: {e}");
                 process::exit(1);
             });
+
+            if !yes && !confirm("Overwrite the save on the cartridge? This cannot be undone.") {
+                eprintln!("Aborted.");
+                process::exit(1);
+            }
 
             match info.cart_type {
                 CartridgeType::GB => {
@@ -1034,7 +1034,7 @@ fn main() {
                     match device.write_save(ChipType::Unknown, info.rom_size, &data, &|cur| {
                         print_progress("Writing", cur, data.len() as u32);
                     }) {
-                        Ok(()) => eprintln!("Save written successfully."),
+                        Ok(()) => eprintln!("Save written."),
                         Err(e) => {
                             eprintln!("\nError: {e}");
                             process::exit(1);
@@ -1077,7 +1077,7 @@ fn main() {
                     match device.write_save(chip, rom_size, &data, &|cur| {
                         print_progress("Writing", cur, data.len() as u32);
                     }) {
-                        Ok(()) => eprintln!("Save written successfully."),
+                        Ok(()) => eprintln!("Save written."),
                         Err(e) => {
                             eprintln!("\nError: {e}");
                             process::exit(1);
@@ -1116,7 +1116,7 @@ fn main() {
                     match device.write_save(header.save_chip, header.rom_size, &data, &|cur| {
                         print_progress("Writing", cur, data.len() as u32);
                     }) {
-                        Ok(()) => eprintln!("Save written successfully."),
+                        Ok(()) => eprintln!("Save written."),
                         Err(e) => {
                             eprintln!("\nError: {e}");
                             process::exit(1);
@@ -1126,7 +1126,7 @@ fn main() {
             }
         }
 
-        Commands::WriteRom { input, force } => {
+        Commands::WriteRom { input, force, yes } => {
             let mut device = open_device();
             // The save size is part of the WriteGame command (Playback sends it), so
             // read the cartridge signature first to learn it.
@@ -1153,6 +1153,11 @@ fn main() {
                 process::exit(1);
             });
 
+            if !yes && !confirm("Write this ROM to the cartridge? This erases it.") {
+                eprintln!("Aborted.");
+                process::exit(1);
+            }
+
             // Pad to 64-byte boundary
             let mut padded = data.clone();
             if padded.len() % 64 != 0 {
@@ -1167,7 +1172,7 @@ fn main() {
                 eprintln!("\r{}    ", msg);
             }) {
                 Ok(()) => {
-                    eprintln!("ROM written successfully.");
+                    eprintln!("ROM written.");
                 }
                 Err(e) => {
                     eprintln!("\nError: {e}");
@@ -1176,29 +1181,61 @@ fn main() {
             }
         }
 
-        Commands::ApplyPatch { rom, patch, output, ignore_checksum } => {
-            apply_patch(&rom, &patch, &output, ignore_checksum);
+        Commands::ApplyPatch { patch, from, output, ignore_checksum, force, yes } => {
+            if let (Some(o), Some(f)) = (output.as_deref(), from.as_deref())
+                && o == f
+            {
+                eprintln!("Output is the same as the input; pass a different -o <path>.");
+                process::exit(1);
+            }
+
+            let mut handle = open_if_cart(from.as_deref(), output.as_deref());
+            let rom = read_rom_source(from.as_deref(), handle.as_mut());
+            let patched = apply_patch_bytes(rom, &patch, ignore_checksum);
+
+            match output.as_deref() {
+                // File destination.
+                Some(out) => {
+                    fs::write(out, &patched).unwrap_or_else(|e| {
+                        eprintln!("Error writing output: {e}");
+                        process::exit(1);
+                    });
+                    eprintln!("Wrote {} ({}).", out.display(), format_size(patched.len() as u32));
+                }
+                // Cart destination: confirm, then flash.
+                None => {
+                    let h = handle.as_mut().expect("cart handle is opened when flashing");
+                    if !yes && !confirm("Flash the patched ROM to the cartridge? This erases it.") {
+                        eprintln!("Aborted.");
+                        process::exit(1);
+                    }
+                    flash_rom(h, patched, force);
+                    eprintln!("Patched ROM written to the cartridge.");
+                }
+            }
+
+            if ignore_checksum {
+                eprintln!("Warning: skipped checksum verification.");
+            }
         }
 
         Commands::Upgrade {
-            rom,
+            from,
             output,
             check,
-            write,
             acknowledge_incompatible_save,
             ignore_checksum,
             force,
-        } => match rom {
-            Some(path) => upgrade_file(&path, output.as_deref(), check, ignore_checksum),
-            None => upgrade_cart(
-                output.as_deref(),
-                check,
-                write,
-                acknowledge_incompatible_save,
-                ignore_checksum,
-                force,
-            ),
-        },
+            yes,
+        } => do_upgrade(
+            from.as_deref(),
+            output.as_deref(),
+            check,
+            yes,
+            acknowledge_incompatible_save,
+            ignore_checksum,
+            force,
+        ),
 
         Commands::ReadCamera { output, from, framed, rom, scaling } => {
             // Acquire the 128 KB SRAM (and, for --framed, the camera ROM) from
@@ -1308,66 +1345,75 @@ fn main() {
                     process::exit(1);
                 }
             }
-            eprintln!("Saved {} photo(s) to {}", slots.len(), output.display());
+            eprintln!("Wrote {} photo(s) to {}.", slots.len(), output.display());
         }
 
-        Commands::WriteCamera { image, from, output, slot, frame, no_dither, write } => {
+        Commands::WriteCamera { image, from, output, slot, frame, no_dither, yes } => {
             let pixels = load_camera_image(&image, !no_dither).unwrap_or_else(|e| {
                 eprintln!("Error reading image: {e}");
                 process::exit(1);
             });
 
-            match from {
-                // File mode: inject into a copy of an existing camera save.
-                Some(base) => {
-                    let Some(out) = output else {
-                        eprintln!("--from requires -o <output save>.");
-                        process::exit(1);
-                    };
-                    let mut save = fs::read(&base).unwrap_or_else(|e| {
-                        eprintln!("Error reading save: {e}");
-                        process::exit(1);
-                    });
-                    let slot = pick_camera_slot(&save, slot);
-                    cartridge::inject_camera_photo(&mut save, slot, &pixels, frame).unwrap_or_else(|e| {
-                        eprintln!("Error injecting photo: {e}");
-                        process::exit(1);
-                    });
-                    fs::write(&out, &save).unwrap_or_else(|e| {
-                        eprintln!("Error writing output: {e}");
-                        process::exit(1);
-                    });
-                    println!("Injected {} into slot {slot}; wrote {}", image.display(), out.display());
-                }
-                // Cart mode: read the camera's save, inject, write it back.
+            if let (Some(o), Some(f)) = (output.as_deref(), from.as_deref())
+                && o == f
+            {
+                eprintln!("Output is the same as the input; pass a different -o <path>.");
+                process::exit(1);
+            }
+
+            // Open the device if the cart is the source or destination, and make sure
+            // it's actually a Game Boy Camera before reading or writing its save.
+            let mut handle = open_if_cart(from.as_deref(), output.as_deref());
+            if let Some(h) = handle.as_ref()
+                && h.info.mbc_type != cartridge::MBC_POCKET_CAMERA
+            {
+                eprintln!(
+                    "This is not a Game Boy Camera cartridge (MBC: {} 0x{:02X}).",
+                    h.info.mbc_name(),
+                    h.info.mbc_type
+                );
+                process::exit(1);
+            }
+
+            // Source: the supplied save file, or the camera's SRAM.
+            let mut save = match from.as_deref() {
+                Some(base) => fs::read(base).unwrap_or_else(|e| {
+                    eprintln!("Error reading save: {e}");
+                    process::exit(1);
+                }),
                 None => {
-                    let mut device = open_device();
-                    let info = read_cart_info(device.as_mut());
-                    if info.mbc_type != cartridge::MBC_POCKET_CAMERA {
-                        eprintln!(
-                            "This is not a Game Boy Camera cartridge (MBC: {} 0x{:02X}).",
-                            info.mbc_name(),
-                            info.mbc_type
-                        );
-                        process::exit(1);
-                    }
-                    eprintln!("Reading camera save ({})...", format_size(info.ram_size));
-                    let mut save = device
-                        .read_save(ChipType::Unknown, info.rom_size, info.ram_size, &|cur| {
-                            print_progress("Reading", cur, info.ram_size)
+                    let h = handle.as_mut().expect("cart handle is opened when reading the cart");
+                    let (rom_size, ram_size) = (h.info.rom_size, h.info.ram_size);
+                    eprintln!("Reading camera save ({})...", format_size(ram_size));
+                    h.device
+                        .read_save(ChipType::Unknown, rom_size, ram_size, &|cur| {
+                            print_progress("Reading", cur, ram_size)
                         })
                         .unwrap_or_else(|e| {
                             eprintln!("\nError: {e}");
                             process::exit(1);
-                        });
+                        })
+                }
+            };
 
-                    let slot = pick_camera_slot(&save, slot);
-                    cartridge::inject_camera_photo(&mut save, slot, &pixels, frame).unwrap_or_else(|e| {
-                        eprintln!("Error injecting photo: {e}");
+            let slot = pick_camera_slot(&save, slot);
+            cartridge::inject_camera_photo(&mut save, slot, &pixels, frame).unwrap_or_else(|e| {
+                eprintln!("Error injecting photo: {e}");
+                process::exit(1);
+            });
+
+            // Destination: a save file, or back onto the camera.
+            match output.as_deref() {
+                Some(out) => {
+                    fs::write(out, &save).unwrap_or_else(|e| {
+                        eprintln!("Error writing output: {e}");
                         process::exit(1);
                     });
-
-                    if !write
+                    eprintln!("Injected {} into slot {slot}; wrote {}.", image.display(), out.display());
+                }
+                None => {
+                    let h = handle.as_mut().expect("cart handle is opened when writing the cart");
+                    if !yes
                         && !confirm(&format!(
                             "Write {} into slot {slot} on the camera? This overwrites its save.",
                             image.display()
@@ -1376,10 +1422,10 @@ fn main() {
                         eprintln!("Aborted.");
                         process::exit(1);
                     }
-
+                    let rom_size = h.info.rom_size;
                     eprintln!("Writing camera save ({})...", format_size(save.len() as u32));
-                    device
-                        .write_save(ChipType::Unknown, info.rom_size, &save, &|cur| {
+                    h.device
+                        .write_save(ChipType::Unknown, rom_size, &save, &|cur| {
                             print_progress("Writing", cur, save.len() as u32)
                         })
                         .unwrap_or_else(|e| {
@@ -1415,7 +1461,7 @@ fn main() {
                             eprintln!("Error writing file: {e}");
                             process::exit(1);
                         });
-                        eprintln!("Saved raw RTC ({} bytes) to {}", payload.len(), path.display());
+                        eprintln!("Wrote raw RTC ({} bytes) to {}.", payload.len(), path.display());
                     }
                 }
                 Err(e) => {
@@ -1425,12 +1471,12 @@ fn main() {
             }
         }
 
-        Commands::WriteRtc { input, days, hours, minutes, seconds } => {
+        Commands::WriteRtc { from, days, hours, minutes, seconds, yes } => {
             let mut device = open_device();
             let info = read_cart_info(device.as_mut());
             require_rtc(&info);
 
-            let payload = match input {
+            let payload = match from {
                 Some(path) => {
                     let data = fs::read(&path).unwrap_or_else(|e| {
                         eprintln!("Error reading file: {e}");
@@ -1458,6 +1504,11 @@ fn main() {
                     .to_payload()
                 }
             };
+
+            if !yes && !confirm("Set the real-time clock on the cartridge?") {
+                eprintln!("Aborted.");
+                process::exit(1);
+            }
 
             eprintln!("Writing RTC...");
             match device.write_rtc(info.rom_size, info.ram_size, &payload) {
