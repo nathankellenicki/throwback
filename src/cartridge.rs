@@ -516,23 +516,29 @@ const CAM_IMAGE_TILES: usize = 224; // 16×14 tiles = 128×112 px
 /// 4-shade grayscale for GB 2bpp pixel values 0..=3 (0 = lightest, 3 = darkest).
 const CAM_SHADES: [u8; 4] = [0xFF, 0xA8, 0x54, 0x00];
 
-/// GB Camera photo order from the directory at 0x11B2: each entry is the slot
-/// (0x00..=0x1D) holding the next photo, terminated by 0xFF. Returns slot indices
-/// in display order (empty if the directory is absent/empty).
+/// GB Camera photo order from the directory at 0x11B2. The directory is indexed
+/// **by slot**: byte `i` holds the display (gallery) position of the photo in slot
+/// `i`, or 0xFF if that slot is empty. Returns the occupied slot indices in display
+/// order (empty if the directory is absent/empty).
+///
+/// (Earlier this read the directory as an ordered list of slot numbers terminated
+/// by 0xFF, which only coincides with the real layout for a pristine, sequentially
+/// filled album — it dropped photos after a deleted slot and mis-ordered reordered
+/// albums.)
 pub fn camera_photo_slots(save: &[u8]) -> Vec<usize> {
-    let mut slots = Vec::new();
     if save.len() < CAM_DIR_OFFSET + 30 {
-        return slots;
+        return Vec::new();
     }
-    for &b in &save[CAM_DIR_OFFSET..CAM_DIR_OFFSET + 30] {
-        if b == 0xFF {
-            break;
-        }
-        if (b as usize) < 30 {
-            slots.push(b as usize);
-        }
-    }
-    slots
+    // (display position, slot) for every occupied slot, ordered by position. Valid
+    // positions are 0x00..=0x1D; 0xFF (or any other value) marks the slot empty.
+    let mut entries: Vec<(u8, usize)> = save[CAM_DIR_OFFSET..CAM_DIR_OFFSET + 30]
+        .iter()
+        .enumerate()
+        .filter(|&(_, &pos)| (pos as usize) < 30)
+        .map(|(slot, &pos)| (pos, slot))
+        .collect();
+    entries.sort_by_key(|&(pos, _)| pos);
+    entries.into_iter().map(|(_, slot)| slot).collect()
 }
 
 /// Decode one GB Camera photo slot to a 128×112 8-bit grayscale buffer (row-major).

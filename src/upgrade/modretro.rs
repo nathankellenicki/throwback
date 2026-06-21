@@ -5,23 +5,45 @@
 //! We present honestly as `throwback/<version>` with a random per-request id (the
 //! service doesn't gate on the client version or fingerprint the id — verified by
 //! probe), rather than impersonating MRUpdater.
+//!
+//! The patcher URL isn't hardcoded: like MRUpdater, we read it from the manifest in
+//! ModRetro's `updates.modretro.com` S3 bucket (an anonymous read — MRUpdater uses
+//! the AWS SDK with unsigned credentials; we use the equivalent path-style HTTPS
+//! URL). If the manifest can't be reached we fall back to the last-known endpoint.
 
 use super::{Artifact, Identity, ServiceError, UpdateService, Upgrade};
 use base64::Engine;
 use serde_json::Value;
+use std::cell::OnceCell;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-const ENDPOINT: &str = "https://cbzr2zpag5.execute-api.us-east-1.amazonaws.com/default/MRPatcher";
+/// The manifest MRUpdater reads (bucket `updates.modretro.com`, key
+/// `apps/manifest.yaml`), reached path-style since the bucket name isn't a DNS host.
+const MANIFEST_URL: &str =
+    "https://s3.us-east-1.amazonaws.com/updates.modretro.com/apps/manifest.yaml";
+/// Used only when the manifest can't be fetched/parsed.
+const FALLBACK_ENDPOINT: &str =
+    "https://cbzr2zpag5.execute-api.us-east-1.amazonaws.com/default/MRPatcher";
 const RESPONSE_VERSION: &str = "2.0";
 const GAME_ID_SIZE: usize = 512; // bytes sent to the lightweight /game_id route
 const TIMEOUT: Duration = Duration::from_secs(30);
 
-pub struct ModRetroService;
+pub struct ModRetroService {
+    /// MRPatcher endpoint, discovered from the manifest on first use and cached.
+    endpoint: OnceCell<String>,
+}
 
 impl ModRetroService {
     pub fn new() -> Self {
-        ModRetroService
+        ModRetroService { endpoint: OnceCell::new() }
+    }
+
+    /// The patcher endpoint, resolved once from the ModRetro manifest (falling back
+    /// to [`FALLBACK_ENDPOINT`] if the manifest is unreachable).
+    fn endpoint(&self) -> &str {
+        self.endpoint
+            .get_or_init(|| resolve_endpoint().unwrap_or_else(|| FALLBACK_ENDPOINT.to_string()))
     }
 
     fn post(&self, url: &str, body: &[u8]) -> Result<Value, ServiceError> {
@@ -62,12 +84,12 @@ impl UpdateService for ModRetroService {
 
     fn identify(&self, rom: &[u8]) -> Result<Option<Identity>, ServiceError> {
         let head = &rom[..rom.len().min(GAME_ID_SIZE)];
-        let v = self.post(&format!("{ENDPOINT}/game_id"), head)?;
+        let v = self.post(&format!("{}/game_id", self.endpoint()), head)?;
         Ok(parse_identify(&v, self.name()))
     }
 
     fn fetch_upgrade(&self, rom: &[u8], id: &Identity) -> Result<Option<Upgrade>, ServiceError> {
-        let v = self.post(ENDPOINT, rom)?;
+        let v = self.post(self.endpoint(), rom)?;
         parse_upgrade(&v, &id.current_version)
     }
 }
@@ -94,6 +116,47 @@ fn random_id() -> String {
         out.push_str(&format!("{z:016x}"));
     }
     out
+}
+
+/// Fetch the ModRetro manifest and read the MRPatcher endpoint from it. Returns
+/// `None` on any network/parse failure (caller falls back to the built-in URL).
+fn resolve_endpoint() -> Option<String> {
+    let body = ureq::get(MANIFEST_URL).timeout(TIMEOUT).call().ok()?.into_string().ok()?;
+    parse_manifest_endpoint(&body)
+}
+
+/// Extract `objects.MRPatcher.endpoint` from the manifest YAML with a small,
+/// dependency-free line scan (the manifest is flat and stable; mirrors how
+/// `check_updates.py` hand-parses the changelog YAML).
+fn parse_manifest_endpoint(yaml: &str) -> Option<String> {
+    let indent = |l: &str| l.len() - l.trim_start().len();
+    let mut block_indent: Option<usize> = None;
+    for line in yaml.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        match block_indent {
+            // Looking for the "MRPatcher:" key.
+            None => {
+                if line.trim() == "MRPatcher:" {
+                    block_indent = Some(indent(line));
+                }
+            }
+            // Inside the MRPatcher block: take its `endpoint:`, or stop if we dedent out.
+            Some(bi) => {
+                if indent(line) <= bi {
+                    break;
+                }
+                if let Some(rest) = line.trim().strip_prefix("endpoint:") {
+                    let url = rest.trim().trim_matches(['"', '\'']);
+                    if url.starts_with("http") {
+                        return Some(url.to_string());
+                    }
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Pull a version-ish field as a string (the API sends strings, but tolerate numbers).
@@ -203,6 +266,31 @@ mod tests {
     fn upgrade_service_error() {
         let v = json!({"error": "corrupt rom"});
         assert!(matches!(parse_upgrade(&v, "1.0"), Err(ServiceError::Service(_))));
+    }
+
+    #[test]
+    fn parses_endpoint_from_manifest() {
+        let yaml = "\
+metadata:
+  manifest_version: 2
+objects:
+  Chromatic Firmware:
+    filename: v4.2.zip
+    directory: firmware/chromatic/current
+    version: v4.2
+  MRPatcher:
+    endpoint: https://cbzr2zpag5.execute-api.us-east-1.amazonaws.com/default/MRPatcher
+";
+        assert_eq!(
+            parse_manifest_endpoint(yaml).as_deref(),
+            Some("https://cbzr2zpag5.execute-api.us-east-1.amazonaws.com/default/MRPatcher")
+        );
+    }
+
+    #[test]
+    fn manifest_without_mrpatcher_endpoint_is_none() {
+        let yaml = "objects:\n  Chromatic Firmware:\n    filename: v4.2.zip\n";
+        assert_eq!(parse_manifest_endpoint(yaml), None);
     }
 
     #[test]

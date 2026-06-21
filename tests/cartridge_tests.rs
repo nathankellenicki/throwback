@@ -483,14 +483,29 @@ fn test_snes_coprocessor() {
 
 #[test]
 fn test_camera_photo_slots() {
-    let mut save = vec![0u8; 0x20000];
-    save[0x11B2..0x11B2 + 4].copy_from_slice(&[0x00, 0x01, 0x02, 0xFF]);
+    // The directory is indexed by slot: dir[slot] = display position, 0xFF = empty.
+    // Real saves pad empty slots with 0xFF (not 0x00).
+    let mut save = vec![0xFFu8; 0x20000];
+    save[0x11B2] = 0; // slot 0 shown first
+    save[0x11B2 + 1] = 1; // slot 1 shown second
+    save[0x11B2 + 2] = 2; // slot 2 shown third
     assert_eq!(camera_photo_slots(&save), vec![0, 1, 2]);
 
-    // 0xFF at the start = no photos.
-    let mut empty = vec![0u8; 0x20000];
-    empty[0x11B2] = 0xFF;
-    assert!(camera_photo_slots(&empty).is_empty());
+    // Order follows display position, not slot number (reordered album).
+    let mut reordered = vec![0xFFu8; 0x20000];
+    reordered[0x11B2] = 2; // slot 0 shown third
+    reordered[0x11B2 + 1] = 0; // slot 1 shown first
+    reordered[0x11B2 + 2] = 1; // slot 2 shown second
+    assert_eq!(camera_photo_slots(&reordered), vec![1, 2, 0]);
+
+    // A gap (empty earlier slot) must not hide later photos (the old break-on-0xFF bug).
+    let mut gap = vec![0xFFu8; 0x20000];
+    gap[0x11B2 + 2] = 0; // slot 2 shown first
+    gap[0x11B2 + 5] = 1; // slot 5 shown second
+    assert_eq!(camera_photo_slots(&gap), vec![2, 5]);
+
+    // All slots empty.
+    assert!(camera_photo_slots(&vec![0xFFu8; 0x20000]).is_empty());
 
     // Too short for a directory.
     assert!(camera_photo_slots(&[0u8; 16]).is_empty());
