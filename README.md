@@ -45,6 +45,8 @@ Run `throwback` with no arguments to list the commands, or `throwback <command> 
 
 Some commands (`write-photo`, `apply-patch`, `upgrade`) read something in and write something out. `--from` sets the source and `-o` sets the destination. Leave either off and that end is the cartridge. With neither, the command reads the cart and writes back to it. Writing to the cartridge asks you to confirm first. Pass `-y` to skip.
 
+`--from` and `-o` can name the same file, to update a ROM or save where it sits. The file is read all the way in before anything is written, and the new version is put in place in one step, so an interrupted run leaves the original file as it was.
+
 ### info
 
 Show what's in the slot without dumping anything: title, type, ROM and save size, region, and whether the cart is writeable.
@@ -206,9 +208,10 @@ throwback upgrade
 throwback upgrade --from dragonyhm.gbc -o dragonyhm_latest.gbc   # file to file
 throwback upgrade -o dragonyhm_latest.gbc                        # upgrade the cart's ROM to a file
 throwback upgrade --check                                        # report only, change nothing
+throwback upgrade --check --from dragonyhm.gbc                   # report on a file, no Operator needed
 ```
 
-`--check` reports what's available and changes nothing. The upgraded ROM is checked before it's written. A service only updates games it recognizes. For anything else, Throwback says so and stops.
+`--check` reports what's available and changes nothing. With `--from`, it reads the file and never looks for the Operator, so you can check a ROM on disk with nothing plugged in. The upgraded ROM is checked before it's written. A service only updates games it recognizes. For anything else, Throwback says so and stops.
 
 When the result goes to the cartridge, Throwback flashes it once you confirm. Pass `-y` to skip. If the update changes the save format, it says so and asks before flashing (or pass `--acknowledge-incompatible-save`). Back up the save first with `read-save` if you want to keep it. Flashing needs a flashable cart, the same as `write-rom`, and `--force` overrides the check.
 
