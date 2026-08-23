@@ -65,7 +65,7 @@ fn multiboot_write_read_extract_roundtrip() {
         make_gb_rom(0x1B, 0x02, 0x02, "GAME TWO"), // MBC5 128K 8K
         make_gb_rom(0x13, 0x04, 0x03, "GAME THREE"), // MBC3 512K 32K
     ];
-    let image = gbmemory::assemble(&menu, &games, None).expect("assemble");
+    let image = gbmemory::assemble(&menu, &games, None, gbmemory::Stamp::blank()).expect("assemble");
 
     let mut dev = open(SimGbMemory::new(&menu));
     dev.read_cartridge_info().unwrap();
@@ -92,7 +92,7 @@ fn multiboot_write_read_extract_roundtrip() {
 #[test]
 fn full_mode_write_roundtrip() {
     let game = make_gb_rom(0x1B, 0x05, 0x03, "SOLOGAME"); // MBC5 1M 32K
-    let image = gbmemory::assemble_full_mode(&game, None).expect("assemble full");
+    let image = gbmemory::assemble_full_mode(&game, None, gbmemory::Stamp::blank()).expect("assemble full");
 
     let mut dev = open(SimGbMemory::new(&game));
     dev.read_cartridge_info().unwrap();

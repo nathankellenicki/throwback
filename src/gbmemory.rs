@@ -83,6 +83,33 @@ pub struct ExtractedGame {
     pub data: Vec<u8>,
 }
 
+/// The 8-byte writer ID throwback stamps into carts it assembles (honest,
+/// self-identifying — never a fake kiosk ID).
+const WRITER_ID: [u8; 8] = *b"THROWBAK";
+
+/// Provenance written into a freshly assembled cart: a real timestamp plus the
+/// throwback writer ID. `blank()` leaves those fields empty (0xFF) — the caller
+/// that reads the clock builds a dated one with `new()`. Restore/`--image`
+/// never uses this (the original map is written verbatim).
+#[derive(Clone, Copy)]
+pub struct Stamp {
+    /// 18 ASCII bytes formatted `MM/DD/YYYYHH:MM:SS`, or all-0xFF for blank.
+    timestamp: [u8; 18],
+    writer: [u8; 8],
+}
+
+impl Stamp {
+    /// No provenance stamp (fields left 0xFF).
+    pub fn blank() -> Self {
+        Self { timestamp: [0xFF; 18], writer: [0xFF; 8] }
+    }
+
+    /// A dated stamp from a preformatted `MM/DD/YYYYHH:MM:SS` timestamp.
+    pub fn new(timestamp: [u8; 18]) -> Self {
+        Self { timestamp, writer: WRITER_ID }
+    }
+}
+
 // --- Header decoding (map/table field derivation) ----------------------------
 
 /// Map the cartridge-header MBC byte (0x147) to the G-MMC1 map's 3-bit MBC code
@@ -239,7 +266,7 @@ fn build_map(entry0: [u8; 3], games: &[GameLayout], old_map: Option<&[u8; MAP_SI
 /// Write one game-table record into the menu region of `rom`. Only menu_index,
 /// f_offset, and f_size are load-bearing for booting; the rest is cosmetic and
 /// filled for authenticity / tooling.
-fn write_table_record(rom: &mut [u8], slot: usize, g: &GameLayout, title: &str) {
+fn write_table_record(rom: &mut [u8], slot: usize, g: &GameLayout, title: &str, stamp: &Stamp) {
     let base = TABLE_BASE + (slot + 1) * TABLE_RECORD; // slot 0 game → record 1
     if base + TABLE_RECORD > rom.len() {
         return;
@@ -270,9 +297,10 @@ fn write_table_record(rom: &mut [u8], slot: usize, g: &GameLayout, title: &str) 
     // title_graphic: 384-byte 2bpp tile strip.
     rec[0x3F..0x1BF].copy_from_slice(&render_title_graphic(title));
 
-    // timestamp (18), kiosk_id (8), padding (23), comment (16): cosmetic.
-    rec[0x1BF..0x1D1].copy_from_slice(b"01/01/2000 00:00:0");
-    rec[0x1D1..0x1D9].copy_from_slice(b"THROWBAK");
+    // timestamp (18) + writer id (8): the real write date + THROWBAK, or 0xFF
+    // when blank. padding (23), comment (16): cosmetic.
+    rec[0x1BF..0x1D1].copy_from_slice(&stamp.timestamp);
+    rec[0x1D1..0x1D9].copy_from_slice(&stamp.writer);
     rec[0x1D9..0x1F0].fill(0xFF);
     rec[0x1F0..0x200].fill(0xFF);
 }
@@ -284,6 +312,7 @@ pub fn assemble(
     menu: &[u8],
     games: &[Vec<u8>],
     old_map: Option<&[u8; MAP_SIZE]>,
+    stamp: Stamp,
 ) -> Result<GbMemoryImage, GbMemoryError> {
     if games.is_empty() {
         return Err(GbMemoryError::NoGames);
@@ -325,7 +354,7 @@ pub fn assemble(
         let take = game.len().min(end - off);
         rom[off..off + take].copy_from_slice(&game[..take]);
         let title = crate::cartridge::parse_gb_title(game).unwrap_or_default();
-        write_table_record(&mut rom, i, l, &title);
+        write_table_record(&mut rom, i, l, &title, &stamp);
     }
 
     let map = build_map(MENU_MAP_ENTRY, &layouts, old_map);
@@ -336,6 +365,7 @@ pub fn assemble(
 pub fn assemble_full_mode(
     game: &[u8],
     old_map: Option<&[u8; MAP_SIZE]>,
+    stamp: Stamp,
 ) -> Result<GbMemoryImage, GbMemoryError> {
     let (mbc, rom_code, ram_kib, blocks) = layout_game(0, game)?;
     let layout = GameLayout {
@@ -354,7 +384,11 @@ pub fn assemble_full_mode(
     // Entry 0 IS the game (no menu), so the mapper boots it directly.
     let entry0 = map_entry(layout.mbc, layout.rom_code, layout.ram_code, 0, 0);
     // No trailing game entries in full mode: the single game is entry 0.
-    let map = build_map(entry0, &[], old_map);
+    let mut map = build_map(entry0, &[], old_map);
+    // In full mode the map sector itself carries the game's provenance
+    // (no menu table), so stamp the timestamp + writer id there.
+    map[0x54..0x66].copy_from_slice(&stamp.timestamp);
+    map[0x66..0x6E].copy_from_slice(&stamp.writer);
     Ok(GbMemoryImage { rom, map })
 }
 
@@ -526,7 +560,7 @@ mod tests {
     fn assemble_single_game_layout() {
         let menu = make_menu();
         let game = make_rom(0x03, 0x03, 0x03, false, "GAME ONE"); // MBC1, 256K, 32K RAM
-        let img = assemble(&menu, std::slice::from_ref(&game), None).unwrap();
+        let img = assemble(&menu, std::slice::from_ref(&game), None, Stamp::blank()).unwrap();
 
         assert_eq!(img.rom.len(), IMAGE_SIZE);
         // Menu copied verbatim, except the game-table records (0x1C200+) that
@@ -560,7 +594,7 @@ mod tests {
             make_rom(0x00, 0x00, 0x00, false, "SECOND"), // ROM-only 32K → block 3
             make_rom(0x1B, 0x04, 0x03, true, "THIRD"),   // MBC5 512K 32K → blocks 4-7
         ];
-        let img = assemble(&menu, &games, None).unwrap();
+        let img = assemble(&menu, &games, None, Stamp::blank()).unwrap();
 
         // Games land at blocks 1, 3, 4.
         assert_eq!(&img.rom[BLOCK..BLOCK + games[0].len()], &games[0][..]);
@@ -583,7 +617,7 @@ mod tests {
     #[test]
     fn assemble_full_mode_entry_is_the_game() {
         let game = make_rom(0x03, 0x00, 0x00, false, "SOLO"); // MBC1 32K no RAM
-        let img = assemble_full_mode(&game, None).unwrap();
+        let img = assemble_full_mode(&game, None, Stamp::blank()).unwrap();
         assert_eq!(img.rom.len(), IMAGE_SIZE);
         assert_eq!(&img.rom[..game.len()], &game[..]); // game at offset 0
         let (mbc, rom_code, _, rom_off, _) = decode_entry(&img.map[0..3]);
@@ -596,12 +630,12 @@ mod tests {
     #[test]
     fn errors() {
         let menu = make_menu();
-        assert!(matches!(assemble(&menu, &[], None), Err(GbMemoryError::NoGames)));
+        assert!(matches!(assemble(&menu, &[], None, Stamp::blank()), Err(GbMemoryError::NoGames)));
 
         let small = make_rom(0x00, 0x00, 0x00, false, "X");
         let too_many: Vec<Vec<u8>> = (0..8).map(|_| small.clone()).collect();
         assert!(matches!(
-            assemble(&menu, &too_many, None),
+            assemble(&menu, &too_many, None, Stamp::blank()),
             Err(GbMemoryError::TooManyGames(8))
         ));
 
@@ -609,13 +643,13 @@ mod tests {
         let big = make_rom(0x1B, 0x04, 0x00, false, "BIG");
         let over: Vec<Vec<u8>> = (0..7).map(|_| big.clone()).collect();
         assert!(matches!(
-            assemble(&menu, &over, None),
+            assemble(&menu, &over, None, Stamp::blank()),
             Err(GbMemoryError::ImageTooLarge { .. })
         ));
 
         // Not a menu ROM.
         assert!(matches!(
-            assemble(&small, std::slice::from_ref(&small), None),
+            assemble(&small, std::slice::from_ref(&small), None, Stamp::blank()),
             Err(GbMemoryError::InvalidMenu)
         ));
     }
@@ -628,7 +662,7 @@ mod tests {
         old[0x6E..0x70].copy_from_slice(&41u16.to_le_bytes());
         old[0x70..0x78].copy_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
 
-        let img = assemble(&menu, &[game], Some(&old)).unwrap();
+        let img = assemble(&menu, &[game], Some(&old), Stamp::blank()).unwrap();
         assert_eq!(u16::from_le_bytes([img.map[0x6E], img.map[0x6F]]), 42);
         assert_eq!(&img.map[0x70..0x78], &[1, 2, 3, 4, 5, 6, 7, 8]);
         assert_eq!(img.map[0x7F], 0x00);
@@ -636,7 +670,7 @@ mod tests {
         // No old map → write count 0.
         let menu2 = make_menu();
         let game2 = make_rom(0x00, 0x00, 0x00, false, "G");
-        let img2 = assemble(&menu2, &[game2], None).unwrap();
+        let img2 = assemble(&menu2, &[game2], None, Stamp::blank()).unwrap();
         assert_eq!(u16::from_le_bytes([img2.map[0x6E], img2.map[0x6F]]), 0);
     }
 
@@ -648,7 +682,7 @@ mod tests {
             make_rom(0x00, 0x00, 0x00, false, "BETA"),
             make_rom(0x1B, 0x02, 0x03, true, "GAMMA"),
         ];
-        let img = assemble(&menu, &games, None).unwrap();
+        let img = assemble(&menu, &games, None, Stamp::blank()).unwrap();
         let got = extract_games(&img.rom, &img.map);
 
         assert_eq!(got.len(), 3); // menu skipped
@@ -666,7 +700,7 @@ mod tests {
     #[test]
     fn extract_full_mode() {
         let game = make_rom(0x03, 0x01, 0x02, false, "ONLYONE"); // 64K
-        let img = assemble_full_mode(&game, None).unwrap();
+        let img = assemble_full_mode(&game, None, Stamp::blank()).unwrap();
         let got = extract_games(&img.rom, &img.map);
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].title, "ONLYONE");

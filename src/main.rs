@@ -944,7 +944,7 @@ fn write_gb_memory_full_mode(device: &mut dyn CartridgeDevice, input: &Path, yes
 
     // Carry the cartridge ID / write count over from the current map.
     let old_map = read_old_gb_memory_map(device);
-    let image = gbmemory::assemble_full_mode(&game, old_map.as_ref()).unwrap_or_else(|e| {
+    let image = gbmemory::assemble_full_mode(&game, old_map.as_ref(), gbmemory::Stamp::new(gb_memory_timestamp())).unwrap_or_else(|e| {
         eprintln!("Error building GB Memory image: {e}");
         process::exit(1);
     });
@@ -1025,7 +1025,7 @@ fn do_write_gb_memory(roms: &[PathBuf], image_mode: bool, yes: bool) {
             })
             .collect();
         let old_map = read_old_gb_memory_map(device.as_mut());
-        let image = gbmemory::assemble(&menu, &games, old_map.as_ref()).unwrap_or_else(|e| {
+        let image = gbmemory::assemble(&menu, &games, old_map.as_ref(), gbmemory::Stamp::new(gb_memory_timestamp())).unwrap_or_else(|e| {
             eprintln!("Error building GB Memory image: {e}");
             process::exit(1);
         });
@@ -1047,14 +1047,55 @@ fn do_write_gb_memory(roms: &[PathBuf], image_mode: bool, yes: bool) {
     eprintln!("GB Memory cartridge written.");
 }
 
-/// Read the current map sector for cart-ID carry-over; None on any failure
-/// (a blank/first-write cart, or an unreadable map — assembly falls back to a
-/// fresh ID).
+/// Current UTC time as the GB Memory map/table timestamp `MM/DD/YYYYHH:MM:SS`
+/// (18 bytes). throwback stamps the true write time (not a fake kiosk date);
+/// UTC keeps it dependency-free.
+fn gb_memory_timestamp() -> [u8; 18] {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0) as i64;
+    let (days, rem) = (secs.div_euclid(86400), secs.rem_euclid(86400));
+    let (hh, mm, ss) = (rem / 3600, (rem % 3600) / 60, rem % 60);
+    // Howard Hinnant's civil-from-days (days since 1970-01-01, proleptic Gregorian).
+    let z = days + 719_468;
+    let era = (if z >= 0 { z } else { z - 146_096 }) / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if m <= 2 { y + 1 } else { y };
+    let s = format!("{m:02}/{d:02}/{year:04}{hh:02}:{mm:02}:{ss:02}");
+    let mut out = [b' '; 18];
+    let bytes = s.as_bytes();
+    let n = bytes.len().min(18);
+    out[..n].copy_from_slice(&bytes[..n]);
+    out
+}
+
+/// Read the current map sector for cart-ID / write-count carry-over. Retries a
+/// few times, because a transient serial timeout here would otherwise silently
+/// reset the cart's identity and history. `None` (fresh ID, count 0) only after
+/// repeated failure — which is expected for a genuinely blank cart, but on a
+/// cart that had contents it means the provenance couldn't be preserved, so we
+/// warn loudly rather than wiping it silently.
 fn read_old_gb_memory_map(device: &mut dyn CartridgeDevice) -> Option<[u8; gbmemory::MAP_SIZE]> {
-    device
-        .read_gb_memory_map()
-        .ok()
-        .and_then(|m| m.try_into().ok())
+    for _ in 0..3 {
+        if let Ok(m) = device.read_gb_memory_map()
+            && let Ok(arr) = <[u8; gbmemory::MAP_SIZE]>::try_from(m)
+        {
+            return Some(arr);
+        }
+    }
+    eprintln!(
+        "Warning: could not read the cartridge's existing map sector. Its cart ID and \
+         write count will be RESET (not carried over). If this cart has contents you \
+         care about, back it up (dump-rom --full) and retry before writing."
+    );
+    None
 }
 
 /// Shared flash-and-verify for GB Memory writes.
