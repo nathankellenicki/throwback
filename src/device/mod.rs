@@ -1,3 +1,5 @@
+pub mod gbxcart;
+
 use crc::{Crc, CRC_32_MPEG_2};
 use std::io::{Read, Write};
 use std::time::Duration;
@@ -44,18 +46,20 @@ pub enum ChipType {
     Flash = 3,
 }
 
-/// Which Epilogue device (and therefore which cartridge family) we're talking to.
+/// Which cartridge device (and therefore which protocol) we're talking to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeviceKind {
     /// GB Operator — GB/GBC/GBA cartridges, legacy protocol.
     GbOperator,
     /// SN Operator — SNES/Super Famicom cartridges, streaming protocol.
     SnOperator,
+    /// insideGadgets GBxCart RW v1.4 — GB/GBC/GBA cartridges, host-driven bus.
+    GbxCart,
 }
 
 #[derive(Debug, Error)]
 pub enum DeviceError {
-    #[error("Operator device not found")]
+    #[error("No cartridge device found (GB/SN Operator or GBxCart RW)")]
     NotFound,
     #[error("Serial port error: {0}")]
     Serial(#[from] serialport::Error),
@@ -65,6 +69,10 @@ pub enum DeviceError {
     NoResponse,
     #[error("{0}")]
     Unsupported(&'static str),
+    #[error("Protocol error: {0}")]
+    Protocol(String),
+    #[error("{0}")]
+    NotFlashable(String),
 }
 
 /// Check if a chunk looks like GBA open bus (sequential u16 from 0).
@@ -156,36 +164,75 @@ pub trait CartridgeDevice {
     }
 }
 
-/// Find the first Operator serial port, returning its name and the device kind.
-fn find_operator() -> Result<(String, DeviceKind), DeviceError> {
+/// CH340 USB-serial bridge IDs used by the GBxCart RW. These are generic
+/// (every CH340 device shares them), so a match only makes a port a
+/// *candidate* — it must pass the GBxCart handshake before being claimed.
+const VID_CH340: u16 = 0x1A86;
+const PID_CH340: u16 = 0x7523;
+
+/// Enumerate candidate cartridge-device ports, Operators first (their VIDs are
+/// unambiguous, so they win deterministically when several devices are
+/// plugged in), then any CH340 ports as GBxCart candidates.
+fn enumerate_candidates() -> Result<Vec<(String, DeviceKind)>, DeviceError> {
     let ports = serialport::available_ports()?;
-    ports
-        .iter()
-        .find_map(|p| match &p.port_type {
-            serialport::SerialPortType::UsbPort(usb)
-                if usb.vid == VID_NEW || usb.vid == VID_OLD =>
-            {
+    let mut candidates = Vec::new();
+    for p in &ports {
+        if let serialport::SerialPortType::UsbPort(usb) = &p.port_type
+            && (usb.vid == VID_NEW || usb.vid == VID_OLD) {
                 let kind = if usb.pid == PID_SN_OPERATOR {
                     DeviceKind::SnOperator
                 } else {
                     DeviceKind::GbOperator
                 };
-                Some((p.port_name.clone(), kind))
+                candidates.push((p.port_name.clone(), kind));
             }
-            _ => None,
-        })
+    }
+    for p in &ports {
+        if let serialport::SerialPortType::UsbPort(usb) = &p.port_type
+            && usb.vid == VID_CH340 && usb.pid == PID_CH340 {
+                candidates.push((p.port_name.clone(), DeviceKind::GbxCart));
+            }
+    }
+    if candidates.is_empty() {
+        return Err(DeviceError::NotFound);
+    }
+    Ok(candidates)
+}
+
+/// Find the first Operator serial port, returning its name and the device kind.
+/// (Used by hardware integration tests that need an Operator specifically.)
+fn find_operator() -> Result<(String, DeviceKind), DeviceError> {
+    enumerate_candidates()?
+        .into_iter()
+        .find(|(_, kind)| *kind != DeviceKind::GbxCart)
         .ok_or(DeviceError::NotFound)
 }
 
-/// Open whichever Operator device is connected, dispatching to the right protocol
-/// implementation based on the detected product ID.
+/// Open whichever cartridge device is connected, dispatching to the right
+/// protocol implementation. Operators are claimed by USB ID; a CH340 port is
+/// claimed only after the GBxCart handshake verifies it (a failing handshake
+/// skips the port — it's some other CH340 device).
 pub fn open() -> Result<Box<dyn CartridgeDevice>, DeviceError> {
-    let (port_name, kind) = find_operator()?;
-    let io = Serial::open(&port_name)?;
-    Ok(match kind {
-        DeviceKind::GbOperator => Box::new(LegacyDevice { io }),
-        DeviceKind::SnOperator => Box::new(StreamingDevice { io }),
-    })
+    // A CH340 port that fails the handshake with an I/O timeout is just some
+    // other CH340 device — that's a NotFound, not an error worth surfacing.
+    // A Protocol failure (a real GBxCart with unsupported firmware) is.
+    let mut informative_err: Option<DeviceError> = None;
+    for (port_name, kind) in enumerate_candidates()? {
+        match kind {
+            DeviceKind::GbOperator => {
+                return Ok(Box::new(LegacyDevice { io: Serial::open(&port_name)? }));
+            }
+            DeviceKind::SnOperator => {
+                return Ok(Box::new(StreamingDevice { io: Serial::open(&port_name)? }));
+            }
+            DeviceKind::GbxCart => match gbxcart::GbxCart::open_port(&port_name) {
+                Ok(dev) => return Ok(Box::new(dev)),
+                Err(e @ DeviceError::Protocol(_)) => informative_err = Some(e),
+                Err(_) => {} // not a GBxCart — keep looking
+            },
+        }
+    }
+    Err(informative_err.unwrap_or(DeviceError::NotFound))
 }
 
 /// Shared serial transport + low-level framing helpers. The command/response framing
@@ -312,6 +359,12 @@ impl Serial {
         save_size: u32,
         progress: &dyn Fn(u32),
     ) -> Result<Vec<u8>, DeviceError> {
+        // Clear residue from a prior op. Critical for the GBA save flow: the
+        // preceding ReadGame early-exits at an open-bus boundary and the
+        // device keeps streaming its ACK window of ROM data — without this
+        // flush those bytes were read back as the "save" (found via a
+        // cross-device check against the GBxCart backend, 2026-08-23).
+        self.flush_input();
         let packet = build_command(CMD_READ_SAVE, chip, rom_size, save_size);
         self.send(&packet)?;
         self.drain(512)?;

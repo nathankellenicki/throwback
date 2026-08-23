@@ -20,7 +20,7 @@ const GBA_MAX_ROM: u32 = 32 * 1024 * 1024; // 32 MB
     // We print `--version` ourselves (just the bare number); clap's built-in
     // flag would prefix the binary name.
     disable_version_flag = true,
-    about = "CLI for the Epilogue GB/SN Operator",
+    about = "CLI for the Epilogue GB/SN Operator and insideGadgets GBxCart RW",
     // Put the version on the second line, just under the intro.
     help_template = "{about-with-newline}Throwback {version}\n\n{usage-heading} {usage}\n\n{all-args}{after-help}"
 )]

@@ -997,9 +997,22 @@ pub fn trim_gba_rom(rom: &[u8]) -> usize {
                 return size;
             }
         }
+    }
 
-        if size == rom.len() {
-            return size;
+    // Uniform-padding tail: some carts pad past the ROM with a constant byte
+    // (0x00 or 0xFF) instead of open bus. A 32-byte sniff at a boundary can't
+    // distinguish padding from a gap between data sections (Pokemon Ruby has
+    // 0xFF at 8MB but data at 14.7MB) — but an exhaustive backward scan can:
+    // nothing real can hide inside a tail verified uniform all the way to the
+    // end. Trim to the smallest power-of-two boundary covering the data.
+    if let Some(&pad) = rom.last()
+        && (pad == 0x00 || pad == 0xFF)
+    {
+        let data_end = rom.iter().rposition(|&b| b != pad).map_or(0, |p| p + 1);
+        for &size in sizes {
+            if size >= data_end && size < rom.len() {
+                return size;
+            }
         }
     }
 

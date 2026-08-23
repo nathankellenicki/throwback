@@ -1,17 +1,18 @@
 # Throwback
 
-A CLI for working with Epilogue's GB Operator and SN Operator.
+A CLI for working with Epilogue's GB Operator and SN Operator, and the insideGadgets GBxCart RW.
 
 It dumps ROMs, backs up and restores saves, reads and sets the clock on RTC carts (such as Pokémon), pulls photos off a Game Boy Camera and writes new ones, flashes ROMs to flash carts, applies IPS, UPS, and BPS patches, and updates games to their latest version.
 
-Throwback is an independent project. It talks to the Operator over USB and is not affiliated with Epilogue.
+Throwback is an independent project. It talks to the devices over USB and is not affiliated with Epilogue or insideGadgets.
 
 ## What it works with
 
 - **GB Operator**: Game Boy, Game Boy Color, Game Boy Advance
 - **SN Operator**: Super Nintendo / Super Famicom
+- **GBxCart RW** (v1.4 family, current firmware): Game Boy, Game Boy Color, Game Boy Advance
 
-Plug the Operator into USB and insert a cartridge, throwback finds the device on its own.
+Plug the device into USB and insert a cartridge, throwback finds it on its own. Every command works the same on either device. If a GBxCart doesn't respond, update it to the current FlashGBX ("L") firmware first.
 
 ## Install
 
