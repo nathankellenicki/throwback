@@ -12,7 +12,7 @@ Throwback is an independent project. It talks to the devices over USB and is not
 - **SN Operator**: Super Nintendo / Super Famicom
 - **GBxCart RW** (v1.4 family, current firmware): Game Boy, Game Boy Color, Game Boy Advance
 
-Plug the device into USB and insert a cartridge, throwback finds it on its own. Every command works the same on either device. If a GBxCart doesn't respond, update it to the current FlashGBX ("L") firmware first.
+Plug the device into USB and insert a cartridge, and Throwback finds it on its own. If a GBxCart doesn't respond, update it to the current FlashGBX ("L") firmware first.
 
 ## Install
 
@@ -82,6 +82,8 @@ throwback dump-rom mario.sfc
 ```
 
 GBA carts are trimmed to their real size. So are SNES carts that read back larger than the game (a 2.5 MB game the hardware reads as 4 MB, for example).
+
+On a Nintendo Power GB Memory cart, `dump-rom` pulls the games off it. Point it at a directory and each game is saved there as its own file. Add `--full` to save the whole cartridge instead, a 1 MB image and its map, which `write-gb-memory` restores later.
 
 ### read-save and write-save
 
@@ -176,6 +178,30 @@ throwback write-rom homebrew.gbc
 ```
 
 This erases the cart and writes the new ROM, so it only works on a flashable cart. Throwback checks the cart first and refuses to touch a retail game. Pass `--force` to write anyway. It asks you to confirm before erasing. Pass `-y` to skip. Hand it the file as-is.
+
+On a Nintendo Power GB Memory cart, `write-rom` writes one game and the cart boots straight into it, with no menu. For a menu of several games, use `write-gb-memory`.
+
+### write-gb-memory
+
+Put several games on a Nintendo Power GB Memory cart, with a menu to choose between them. These carts need the GBxCart.
+
+Give it up to seven ROMs, as many as fit in the cart's 896 KB:
+
+```
+throwback write-gb-memory tetris.gbc mario.gbc kirby.gbc
+```
+
+Throwback fits them together with the Nintendo Power menu and writes the cart. Turn the cart on and the menu lists each game. Pick one and it runs, with its own saves. The menu comes from a file Throwback needs alongside it, at `assets/gbmemory_menu.gb`.
+
+Restore a backup made with `dump-rom --full`:
+
+```
+throwback write-gb-memory --image backup.bin
+```
+
+This writes the cartridge back the way it was.
+
+Writing erases the whole cart. It asks you to confirm first. Pass `-y` to skip. Back the cart up with `dump-rom --full` first.
 
 ### apply-patch
 
