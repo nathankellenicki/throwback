@@ -8,6 +8,7 @@ use throwback::cartridge::{
     trim_gba_rom,
 };
 use throwback::device::{self, CartridgeDevice, ChipType};
+use throwback::gbmemory;
 use throwback::patch::{self, Patch};
 use throwback::upgrade::{self, Identity, Upgrade};
 
@@ -42,8 +43,15 @@ enum Commands {
     },
     /// Dump ROM to a file
     DumpRom {
-        /// Output file path
+        /// Output path. A file for a normal cart. For a multi-game GB Memory
+        /// cart, give a directory (existing, or with a trailing slash) and each
+        /// game is written into it.
         output: PathBuf,
+        /// GB Memory only: dump the full 1 MB cartridge image (plus a `.map`
+        /// sidecar) as a faithful, restorable backup, instead of extracting
+        /// the individual games.
+        #[arg(long)]
+        full: bool,
     },
     /// Read save data to a file
     ReadSave {
@@ -72,6 +80,20 @@ enum Commands {
         #[arg(long)]
         force: bool,
         /// Skip the confirmation prompt
+        #[arg(short, long)]
+        yes: bool,
+    },
+    /// Build a multi-game menu (multiboot) GB Memory cartridge from 1-7 ROMs,
+    /// or restore a full cartridge image backed up with `dump-rom --full`.
+    WriteGbMemory {
+        /// Game ROMs to combine (1-7), or a single `.map`-paired image file
+        /// (from `dump-rom --full`) when `--image` is given.
+        roms: Vec<PathBuf>,
+        /// Flash a pre-built / backed-up 1 MB image verbatim (with its `.map`
+        /// sidecar if present) instead of assembling ROMs into a menu.
+        #[arg(long)]
+        image: bool,
+        /// Skip the confirmation prompt.
         #[arg(short, long)]
         yes: bool,
     },
@@ -795,6 +817,259 @@ fn dump_rom_snes(device: &mut dyn CartridgeDevice, info: &CartridgeInfo, output:
     eprintln!("Wrote {}.", output.display());
 }
 
+// --- GB Memory (Nintendo Power / G-MMC1) ------------------------------------
+
+/// Locate the bundled Nintendo Power menu ROM (`assets/` next to the binary).
+fn menu_rom_path() -> PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(Path::to_path_buf))
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("assets")
+        .join("gbmemory_menu.gb")
+}
+
+fn load_menu_rom() -> Vec<u8> {
+    let path = menu_rom_path();
+    fs::read(&path).unwrap_or_else(|e| {
+        eprintln!("Could not load the GB Memory menu ROM at {}: {e}", path.display());
+        eprintln!("It must be present to build a multi-game (menu) cartridge.");
+        process::exit(1);
+    })
+}
+
+/// Whether `output` names a directory: it exists as one, or ends with a
+/// path separator (so `./mycart/` means "a new directory").
+fn is_dir_target(output: &Path) -> bool {
+    if output.is_dir() {
+        return true;
+    }
+    output
+        .as_os_str()
+        .to_str()
+        .map(|s| s.ends_with('/') || s.ends_with(std::path::MAIN_SEPARATOR))
+        .unwrap_or(false)
+}
+
+/// A safe filename for an extracted game (`01_TITLE.gb`, prefix only when many).
+fn game_filename(game: &gbmemory::ExtractedGame, index: usize, many: bool) -> String {
+    let title: String = game
+        .title
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect();
+    let title = title.trim_matches('_');
+    let title = if title.is_empty() { "GAME" } else { title };
+    let ext = if game.is_cgb { "gbc" } else { "gb" };
+    if many {
+        format!("{:02}_{title}.{ext}", index + 1)
+    } else {
+        format!("{title}.{ext}")
+    }
+}
+
+/// `dump-rom` for a GB Memory cart: extract each game as a playable ROM, or
+/// (with `--full`) capture the whole 1 MB image + `.map` sidecar as a backup.
+fn dump_gb_memory(device: &mut dyn CartridgeDevice, output: &Path, full: bool) {
+    eprintln!("Reading GB Memory cartridge (1 MB)...");
+    let (image, map) = device
+        .read_gb_memory(&|cur| print_progress("Reading", cur, gbmemory::IMAGE_SIZE as u32))
+        .unwrap_or_else(|e| {
+            eprintln!("\nError: {e}");
+            process::exit(1);
+        });
+
+    if full {
+        // Faithful, restorable backup: the whole image plus its map sidecar.
+        fs::write(output, &image).unwrap_or_else(|e| {
+            eprintln!("Error writing file: {e}");
+            process::exit(1);
+        });
+        let map_path = output.with_extension("map");
+        fs::write(&map_path, &map).unwrap_or_else(|e| {
+            eprintln!("Error writing map sidecar: {e}");
+            process::exit(1);
+        });
+        eprintln!("Wrote {} + {}.", output.display(), map_path.display());
+        return;
+    }
+
+    let map_arr: [u8; gbmemory::MAP_SIZE] = map.try_into().unwrap_or([0u8; gbmemory::MAP_SIZE]);
+    let games = gbmemory::extract_games(&image, &map_arr);
+    if games.is_empty() {
+        eprintln!("No games found on this GB Memory cartridge.");
+        process::exit(1);
+    }
+
+    let dir_mode = is_dir_target(output);
+    if games.len() > 1 && !dir_mode {
+        eprintln!(
+            "This cartridge has {} games. Give a directory instead, e.g. dump-rom ./mycart/",
+            games.len()
+        );
+        process::exit(1);
+    }
+
+    if dir_mode {
+        fs::create_dir_all(output).unwrap_or_else(|e| {
+            eprintln!("Error creating output directory: {e}");
+            process::exit(1);
+        });
+        let many = games.len() > 1;
+        for (i, game) in games.iter().enumerate() {
+            let path = output.join(game_filename(game, i, many));
+            fs::write(&path, &game.data).unwrap_or_else(|e| {
+                eprintln!("Error writing {}: {e}", path.display());
+                process::exit(1);
+            });
+            eprintln!("Wrote {} ({}).", path.display(), format_size(game.data.len() as u32));
+        }
+        eprintln!("Extracted {} game(s) to {}.", games.len(), output.display());
+    } else {
+        // Single game to a file.
+        fs::write(output, &games[0].data).unwrap_or_else(|e| {
+            eprintln!("Error writing file: {e}");
+            process::exit(1);
+        });
+        eprintln!("Wrote {}.", output.display());
+    }
+}
+
+/// `write-rom` on a GB Memory cart: single game, full mode (direct boot).
+fn write_gb_memory_full_mode(device: &mut dyn CartridgeDevice, input: &Path, yes: bool) {
+    let game = fs::read(input).unwrap_or_else(|e| {
+        eprintln!("Error reading file: {e}");
+        process::exit(1);
+    });
+
+    // Carry the cartridge ID / write count over from the current map.
+    let old_map = read_old_gb_memory_map(device);
+    let image = gbmemory::assemble_full_mode(&game, old_map.as_ref()).unwrap_or_else(|e| {
+        eprintln!("Error building GB Memory image: {e}");
+        process::exit(1);
+    });
+
+    if !yes
+        && !confirm(
+            "Write this ROM to the GB Memory cartridge? This ERASES the whole cart, \
+             including the original Nintendo Power menu and games.",
+        )
+    {
+        eprintln!("Aborted.");
+        process::exit(1);
+    }
+
+    flash_gb_memory(device, &image.rom, &image.map);
+    eprintln!("Wrote {} to the GB Memory cartridge (full mode, boots directly).", input.display());
+}
+
+/// `write-gb-memory`: assemble 1-7 ROMs into a menu cart, or restore a full
+/// image backed up with `dump-rom --full`.
+fn do_write_gb_memory(roms: &[PathBuf], image_mode: bool, yes: bool) {
+    if roms.is_empty() {
+        eprintln!("Give at least one ROM (or an image file with --image).");
+        process::exit(1);
+    }
+
+    let mut device = open_device();
+    let info = read_cart_info(device.as_mut());
+    if info.cart_type != CartridgeType::GB || !device.is_gb_memory().unwrap_or(false) {
+        eprintln!("This is not a GB Memory (Nintendo Power) cartridge.");
+        process::exit(1);
+    }
+
+    let (rom, map) = if image_mode {
+        // Restore a pre-built / backed-up 1 MB image (+ .map sidecar if present).
+        if roms.len() != 1 {
+            eprintln!("--image takes exactly one image file.");
+            process::exit(1);
+        }
+        let rom = fs::read(&roms[0]).unwrap_or_else(|e| {
+            eprintln!("Error reading image: {e}");
+            process::exit(1);
+        });
+        if rom.len() != gbmemory::IMAGE_SIZE {
+            eprintln!(
+                "Image must be exactly {} bytes (got {}).",
+                gbmemory::IMAGE_SIZE,
+                rom.len()
+            );
+            process::exit(1);
+        }
+        let map_path = roms[0].with_extension("map");
+        let map = match fs::read(&map_path) {
+            Ok(m) if m.len() == gbmemory::MAP_SIZE => m,
+            _ => {
+                eprintln!(
+                    "No valid .map sidecar at {}; cannot restore without it.",
+                    map_path.display()
+                );
+                process::exit(1);
+            }
+        };
+        (rom, map)
+    } else {
+        // Assemble a menu multiboot image from the game ROMs.
+        if roms.len() > gbmemory::MAX_GAMES {
+            eprintln!("At most {} games fit on a GB Memory cartridge.", gbmemory::MAX_GAMES);
+            process::exit(1);
+        }
+        let menu = load_menu_rom();
+        let games: Vec<Vec<u8>> = roms
+            .iter()
+            .map(|p| {
+                fs::read(p).unwrap_or_else(|e| {
+                    eprintln!("Error reading {}: {e}", p.display());
+                    process::exit(1);
+                })
+            })
+            .collect();
+        let old_map = read_old_gb_memory_map(device.as_mut());
+        let image = gbmemory::assemble(&menu, &games, old_map.as_ref()).unwrap_or_else(|e| {
+            eprintln!("Error building GB Memory image: {e}");
+            process::exit(1);
+        });
+        (image.rom, image.map.to_vec())
+    };
+
+    if !yes
+        && !confirm(&format!(
+            "Write {} game(s) to the GB Memory cartridge? This ERASES the whole cart, \
+             including the original Nintendo Power menu and games.",
+            if image_mode { 0 } else { roms.len() }
+        ))
+    {
+        eprintln!("Aborted.");
+        process::exit(1);
+    }
+
+    flash_gb_memory(device.as_mut(), &rom, &map);
+    eprintln!("GB Memory cartridge written.");
+}
+
+/// Read the current map sector for cart-ID carry-over; None on any failure
+/// (a blank/first-write cart, or an unreadable map — assembly falls back to a
+/// fresh ID).
+fn read_old_gb_memory_map(device: &mut dyn CartridgeDevice) -> Option<[u8; gbmemory::MAP_SIZE]> {
+    device
+        .read_gb_memory_map()
+        .ok()
+        .and_then(|m| m.try_into().ok())
+}
+
+/// Shared flash-and-verify for GB Memory writes.
+fn flash_gb_memory(device: &mut dyn CartridgeDevice, rom: &[u8], map: &[u8]) {
+    if let Err(e) = device.write_gb_memory(
+        rom,
+        map,
+        &|cur| print_progress("Writing", cur, rom.len() as u32),
+        &|msg| eprintln!("\r{msg}    "),
+    ) {
+        eprintln!("\nError: {e}");
+        process::exit(1);
+    }
+}
+
 fn main() {
     let cli = Cli::parse();
 
@@ -899,9 +1174,18 @@ fn main() {
             }
         }
 
-        Commands::DumpRom { output } => {
+        Commands::DumpRom { output, full } => {
             let mut device = open_device();
             let info = read_cart_info(device.as_mut());
+
+            // A GB Memory cart needs the G-MMC1-aware path: extract each game,
+            // or (with --full) capture the whole 1 MB image + map as a backup.
+            if info.cart_type == CartridgeType::GB
+                && device.is_gb_memory().unwrap_or(false)
+            {
+                dump_gb_memory(device.as_mut(), &output, full);
+                return;
+            }
 
             match info.cart_type {
                 CartridgeType::GB => dump_rom_gb(device.as_mut(), &info, &output),
@@ -1216,6 +1500,15 @@ fn main() {
             // read the cartridge signature first to learn it.
             let info = read_cart_info(device.as_mut());
 
+            // GB Memory cart: write the single ROM in full mode (direct boot,
+            // no menu). Use `write-gb-memory` for a multi-game menu instead.
+            if info.cart_type == CartridgeType::GB
+                && device.is_gb_memory().unwrap_or(false)
+            {
+                write_gb_memory_full_mode(device.as_mut(), &input, yes);
+                return;
+            }
+
             // Safety guard: WriteGame erases the cart. A retail mask-ROM cart can't be
             // flashed, so refuse unless --force. (DetectFlashcart is read-only.)
             if !force {
@@ -1263,6 +1556,10 @@ fn main() {
                     process::exit(1);
                 }
             }
+        }
+
+        Commands::WriteGbMemory { roms, image, yes } => {
+            do_write_gb_memory(&roms, image, yes);
         }
 
         Commands::ApplyPatch { patch, from, output, ignore_checksum, force, yes } => {

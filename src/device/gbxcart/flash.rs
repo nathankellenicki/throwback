@@ -237,12 +237,13 @@ impl<T: Transport> GbxCart<T> {
     }
 
     /// Convert an absolute DMG flash address to (MBC5 bank, bus address).
-    fn dmg_window(abs: u32) -> (u32, u32) {
+    /// Shared with the GB Memory writer (`gbmemory.rs`).
+    pub(super) fn dmg_window(abs: u32) -> (u32, u32) {
         let bank = abs / 0x4000;
         if bank == 0 { (0, abs) } else { (bank, 0x4000 + abs % 0x4000) }
     }
 
-    fn select_dmg_bank(&mut self, bank: u32) -> Result<(), DeviceError> {
+    pub(super) fn select_dmg_bank(&mut self, bank: u32) -> Result<(), DeviceError> {
         for (addr, value) in rom_bank_writes(MbcKind::Mbc5, bank) {
             self.dmg_write(addr, value)?;
         }

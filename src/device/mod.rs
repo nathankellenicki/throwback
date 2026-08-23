@@ -162,6 +162,38 @@ pub trait CartridgeDevice {
     ) -> Result<(), DeviceError> {
         Err(DeviceError::Unsupported("RTC is not supported on this device"))
     }
+
+    /// Whether the inserted cartridge is a Nintendo Power GB Memory (G-MMC1)
+    /// cart. Only the GBxCart can drive it (the Operator has no raw-bus path).
+    fn is_gb_memory(&mut self) -> Result<bool, DeviceError> {
+        Ok(false)
+    }
+
+    /// Read a GB Memory cart: the full 1 MiB flash image and its 128-byte
+    /// hidden map sector. Unsupported devices error.
+    fn read_gb_memory(
+        &mut self,
+        _progress: &dyn Fn(u32),
+    ) -> Result<(Vec<u8>, Vec<u8>), DeviceError> {
+        Err(DeviceError::Unsupported("GB Memory is not supported on this device"))
+    }
+
+    /// Read only the GB Memory map sector (cheap; for cart-ID carry-over).
+    fn read_gb_memory_map(&mut self) -> Result<Vec<u8>, DeviceError> {
+        Err(DeviceError::Unsupported("GB Memory is not supported on this device"))
+    }
+
+    /// Write a full 1 MiB image + 128-byte map sector to a GB Memory cart
+    /// (chip-erases first). Unsupported devices error.
+    fn write_gb_memory(
+        &mut self,
+        _image: &[u8],
+        _map: &[u8],
+        _progress: &dyn Fn(u32),
+        _erase_progress: &dyn Fn(&str),
+    ) -> Result<(), DeviceError> {
+        Err(DeviceError::Unsupported("GB Memory is not supported on this device"))
+    }
 }
 
 /// CH340 USB-serial bridge IDs used by the GBxCart RW. These are generic

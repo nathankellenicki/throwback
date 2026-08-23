@@ -141,3 +141,53 @@ fn e2e_flashcart_detection_recognizes_flashcart() {
         "flashcart not recognized — its flash ID is printed above; add a profile"
     );
 }
+
+// --- GB Memory (Nintendo Power / G-MMC1) --------------------------------------
+//
+// Read-only checks against a real GB Memory cart. The actual WRITE is left to a
+// careful, human-confirmed CLI session (`throwback dump-rom --full` to back up
+// first, then `write-rom` / `write-gb-memory`) — it erases a collectible cart,
+// so it is deliberately not automated here.
+
+#[test]
+#[ignore]
+fn e2e_gb_memory_detected() {
+    let mut dev = open_gbxcart();
+    dev.read_cartridge_info().expect("signature");
+    assert!(
+        dev.is_gb_memory().expect("gb memory probe"),
+        "insert a GB Memory (Nintendo Power) cart for this test"
+    );
+}
+
+#[test]
+#[ignore]
+fn e2e_gb_memory_dump_and_extract() {
+    // Reads the full 1 MB image + map, then confirms games extract with valid
+    // headers. Non-destructive.
+    use throwback::gbmemory;
+    let mut dev = open_gbxcart();
+    dev.read_cartridge_info().expect("signature");
+    assert!(dev.is_gb_memory().expect("probe"), "insert a GB Memory cart");
+
+    let (image, map) = dev.read_gb_memory(&|_| {}).expect("read gb memory");
+    assert_eq!(image.len(), gbmemory::IMAGE_SIZE);
+    let map_arr: [u8; gbmemory::MAP_SIZE] = map.try_into().expect("map size");
+    let games = gbmemory::extract_games(&image, &map_arr);
+    eprintln!("Found {} game(s):", games.len());
+    for g in &games {
+        eprintln!("  {} ({} KB, {})", g.title, g.data.len() / 1024, if g.is_cgb { "GBC" } else { "GB" });
+        // Each extracted game must start with the Nintendo logo.
+        assert_eq!(&g.data[0x104..0x110], &gbmemory_logo()[..12], "valid GB header");
+    }
+    assert!(!games.is_empty(), "a menu cart should contain at least one game");
+}
+
+fn gbmemory_logo() -> [u8; 48] {
+    [
+        0xCE, 0xED, 0x66, 0x66, 0xCC, 0x0D, 0x00, 0x0B, 0x03, 0x73, 0x00, 0x83, 0x00, 0x0C, 0x00,
+        0x0D, 0x00, 0x08, 0x11, 0x1F, 0x88, 0x89, 0x00, 0x0E, 0xDC, 0xCC, 0x6E, 0xE6, 0xDD, 0xDD,
+        0xD9, 0x99, 0xBB, 0xBB, 0x67, 0x63, 0x6E, 0x0E, 0xEC, 0xCC, 0xDD, 0xDC, 0x99, 0x9F, 0xBB,
+        0xB9, 0x33, 0x3E,
+    ]
+}

@@ -1199,3 +1199,326 @@ impl Transport for SimGbxCart {
         self.out.clear();
     }
 }
+
+// --- Standalone G-MMC1 (GB Memory) simulator --------------------------------
+//
+// A focused device model for the GB Memory write/read/detect flows, separate
+// from SimGbxCart (which models normal DMG/AGB carts). It is lenient about the
+// exact flash command sequences — its job is to validate the driver's
+// *addressing, mode gating, and opcode framing* end to end (write -> read-back
+// -> extract), not to re-enforce the hardware's command FSM (the pure map /
+// assembly correctness is covered by the src/gbmemory.rs unit tests).
+
+pub struct SimGbMemory {
+    pub flash: Vec<u8>,       // 1 MiB
+    pub hidden_map: [u8; 128],
+    out: VecDeque<u8>,
+    buf: Vec<u8>,
+    vars: HashMap<(u8, u32), u32>,
+    bank: u32,
+    bank_broken: bool,
+    awake: bool,
+    map_full: bool,
+    map_read_mode: bool,
+    map_program_mode: bool,
+    autoselect: bool,
+    busy: u32,
+    // staged MMC command + args
+    mmc_cmd: u8,
+    mmc_arg_hi: u8,
+    mmc_arg_lo: u8,
+    mmc_data: u8,
+    b7_buffer: Vec<u8>,
+    expect_data: Option<(u8, usize)>, // (opcode, remaining length)
+    pub fw_ver: u16,
+    pub pcb_ver: u8,
+}
+
+impl SimGbMemory {
+    /// A GB Memory cart whose flash currently holds `initial` at offset 0
+    /// (e.g. a menu ROM for a menu-state cart, or a game for full mode).
+    pub fn new(initial: &[u8]) -> Self {
+        let mut flash = vec![0xFFu8; 0x100000];
+        let n = initial.len().min(flash.len());
+        flash[..n].copy_from_slice(&initial[..n]);
+        Self {
+            flash,
+            hidden_map: [0xFF; 128],
+            out: VecDeque::new(),
+            buf: Vec::new(),
+            vars: HashMap::new(),
+            bank: 1,
+            bank_broken: false,
+            awake: false,
+            map_full: false,
+            map_read_mode: false,
+            map_program_mode: false,
+            autoselect: false,
+            busy: 0,
+            mmc_cmd: 0,
+            mmc_arg_hi: 0,
+            mmc_arg_lo: 0,
+            mmc_data: 0,
+            b7_buffer: Vec::new(),
+            expect_data: None,
+            fw_ver: 14,
+            pcb_ver: 6,
+        }
+    }
+
+    fn var(&self, w: u8, k: u32) -> u32 {
+        *self.vars.get(&(w, k)).unwrap_or(&0)
+    }
+
+    /// Map a bus-window address (+ current MBC5 bank) to a linear flash offset.
+    /// The switchable window (>= 0x4000) cannot show bank 0 — selecting bank 0
+    /// there reads bank 1, as on real hardware — so bank 0 is reachable only
+    /// through the fixed 0x0000 window. (This models the hardware behaviour
+    /// that a uniform switchable-window read silently drops the header.)
+    fn flash_abs(&self, waddr: usize) -> usize {
+        if waddr < 0x4000 {
+            waddr
+        } else {
+            let bank = if self.bank_broken { 1 } else { self.bank.max(1) } as usize;
+            bank * 0x4000 + (waddr - 0x4000)
+        }
+    }
+
+    /// Execute a staged MMC command (0x013F = 0xA5).
+    fn mmc_execute(&mut self) {
+        match self.mmc_cmd {
+            0x09 => self.awake = true,
+            0x08 => self.awake = false,
+            0x11 => {} // enable MBC regs (no-op here)
+            0x10 => {} // disable MBC regs
+            0x04 => self.map_full = true,
+            0x05 => self.map_full = false,
+            0x02 => {} // WP disable (no-op)
+            0x0A => {} // WP arm (no-op)
+            0x0F => {
+                let addr = ((self.mmc_arg_hi as u16) << 8) | self.mmc_arg_lo as u16;
+                self.flash_command(addr, self.mmc_data);
+            }
+            _ => {}
+        }
+    }
+
+    /// Lenient flash command handling (direct writes via MMC cmd 0x0F).
+    fn flash_command(&mut self, addr: u16, data: u8) {
+        match (addr, data) {
+            (_, 0xF0) => {
+                // Reset to read-array mode: exits autoselect and the hidden-map
+                // read/program modes.
+                self.autoselect = false;
+                self.map_read_mode = false;
+                self.map_program_mode = false;
+            }
+            (0x5555, 0x90) => self.autoselect = true,
+            (0x5555, 0x10) => {
+                self.flash.fill(0xFF); // chip erase
+                self.busy = 2;
+            }
+            (0x5555, 0x04) => {
+                self.hidden_map = [0xFF; 128]; // hidden-map erase
+                self.busy = 2;
+            }
+            (0x5555, 0xE0) => self.map_program_mode = true,
+            (0x5555, 0x77) => self.map_read_mode = true,
+            _ => {}
+        }
+    }
+
+    fn bus_write(&mut self, addr: u16, val: u8) {
+        match addr {
+            0x0120 => self.mmc_cmd = val,
+            0x0121 | 0x0122 => {} // wakeup args (unchecked)
+            0x0125 => self.mmc_arg_hi = val,
+            0x0126 => self.mmc_arg_lo = val,
+            0x0127 => self.mmc_data = val,
+            0x013F if val == 0xA5 => self.mmc_execute(),
+            // G-MMC1 map-full banking uses 0x2100 only (full 8 bits). Writing
+            // the MBC5 9th-bit register 0x3000 breaks banking on real hardware
+            // (every switchable read returns the same bank), so model that.
+            0x2100 => {
+                self.bank = val as u32;
+                self.bank_broken = false;
+            }
+            0x3000 => self.bank_broken = true,
+            // Map program trigger: commit the 0xB7 buffer into the map.
+            0x007F if val == 0xFF && self.map_program_mode && self.b7_buffer.len() >= 128 => {
+                self.hidden_map.copy_from_slice(&self.b7_buffer[..128]);
+                self.busy = 2;
+            }
+            _ => {}
+        }
+    }
+
+    fn read_bytes(&mut self, len: usize) -> Vec<u8> {
+        let addr = self.var(4, 0) as usize; // ADDRESS (32-bit, id 0)
+        let mut out = Vec::with_capacity(len);
+        for i in 0..len {
+            let a = addr + i;
+            let byte = if self.autoselect {
+                [0xC2u8, 0x89][a & 1]
+            } else if self.map_read_mode && a < 0x80 {
+                self.hidden_map[a & 0x7F]
+            } else if len == 1 {
+                // Status poll.
+                if self.busy > 0 {
+                    self.busy -= 1;
+                    0x00
+                } else {
+                    0x80
+                }
+            } else {
+                let abs = self.flash_abs(a);
+                self.flash.get(abs).copied().unwrap_or(0xFF)
+            };
+            out.push(byte);
+        }
+        // Firmware auto-increments its address across successive data reads
+        // (not for autoselect ID, hidden-map, or 1-byte status polls).
+        let data_read = !(self.autoselect || (self.map_read_mode && addr < 0x80)) && len != 1;
+        if data_read {
+            self.vars.insert((4, 0), (addr + len) as u32);
+        }
+        out
+    }
+
+    fn program(&mut self, data: &[u8]) {
+        let waddr = self.var(4, 0) as usize;
+        let base = self.flash_abs(waddr);
+        for (i, &b) in data.iter().enumerate() {
+            if let Some(cell) = self.flash.get_mut(base + i) {
+                *cell &= b; // flash AND semantics (erased = 0xFF)
+            }
+        }
+        // Firmware auto-increments the program address across chunks.
+        self.vars.insert((4, 0), (waddr + data.len()) as u32);
+    }
+
+    fn ack(&mut self) {
+        self.out.push_back(0x01);
+    }
+
+    fn exec(&mut self, cmd: u8, frame: &[u8]) {
+        match cmd {
+            0x68 => self.out.push_back(self.pcb_ver),
+            0x56 => self.out.push_back(30),
+            0xA1 => {
+                let mut body = vec![8u8, b'L'];
+                body.extend_from_slice(&self.fw_ver.to_be_bytes());
+                body.push(self.pcb_ver);
+                body.extend_from_slice(&0x6A00_0000u32.to_be_bytes());
+                body.push(4);
+                body.extend_from_slice(b"gbxc");
+                body.push(0b0000_0001);
+                body.push(1);
+                self.out.extend(body);
+            }
+            0xA2 | 0xA3 | 0xA4 | 0xA5 | 0xA8 | 0xB4 | 0xC9 | 0xF2 | 0xF3 => self.ack(),
+            0xF4 => self.out.push_back(1), // powered
+            0xA6 => {
+                let width = frame[1];
+                let key = u32::from_be_bytes(frame[2..6].try_into().unwrap());
+                let value = u32::from_be_bytes(frame[6..10].try_into().unwrap());
+                self.vars.insert((width, key), value);
+                self.ack();
+            }
+            0xA7 => self.ack(), // SET_FLASH_CMD
+            0xB2 => {
+                let addr = u32::from_be_bytes(frame[1..5].try_into().unwrap()) as u16;
+                self.bus_write(addr, frame[5]);
+                self.ack();
+            }
+            0xB1 => {
+                let n = self.var(2, 0) as usize; // TRANSFER_SIZE (16-bit, id 0)
+                let data = self.read_bytes(n);
+                self.out.extend(data);
+            }
+            0xC1 => {
+                // AGB read during the AGB-first probe: not a GBA cart -> 0xFF.
+                let n = self.var(2, 0) as usize;
+                self.out.extend(std::iter::repeat_n(0xFFu8, n));
+            }
+            _ => panic!("SimGbMemory: unhandled opcode 0x{cmd:02X}"),
+        }
+    }
+
+    fn pump(&mut self) {
+        loop {
+            if let Some((cmd, len)) = self.expect_data {
+                if self.buf.len() < len {
+                    return;
+                }
+                let data: Vec<u8> = self.buf.drain(..len).collect();
+                self.expect_data = None;
+                match cmd {
+                    0xD3 => {
+                        self.program(&data);
+                        self.ack();
+                    }
+                    0xB7 => {
+                        self.b7_buffer = data;
+                        self.ack();
+                    }
+                    _ => unreachable!(),
+                }
+                continue;
+            }
+            let Some(&cmd) = self.buf.first() else { return };
+            let fixed = match cmd {
+                0x68 | 0x56 | 0xA1 | 0xA2 | 0xA3 | 0xA4 | 0xA5 | 0xA8 | 0xB1 | 0xB4 | 0xC1
+                | 0xC9 | 0xF2 | 0xF3 | 0xF4 => Some(1),
+                0xB2 => Some(6),
+                0xA6 => Some(10),
+                0xA7 => Some(40),
+                _ => None,
+            };
+            if let Some(n) = fixed {
+                if self.buf.len() < n {
+                    return;
+                }
+                let frame: Vec<u8> = self.buf.drain(..n).collect();
+                self.exec(cmd, &frame);
+                continue;
+            }
+            match cmd {
+                0xD3 => {
+                    self.buf.drain(..1);
+                    self.expect_data = Some((0xD3, self.var(2, 0) as usize));
+                }
+                0xB7 => {
+                    self.buf.drain(..1);
+                    self.expect_data = Some((0xB7, 128));
+                }
+                other => panic!("SimGbMemory: unknown opcode 0x{other:02X}"),
+            }
+        }
+    }
+}
+
+impl Transport for SimGbMemory {
+    fn write_all(&mut self, buf: &[u8]) -> Result<(), DeviceError> {
+        self.buf.extend_from_slice(buf);
+        self.pump();
+        Ok(())
+    }
+    fn read_exact(&mut self, buf: &mut [u8]) -> Result<(), DeviceError> {
+        for b in buf.iter_mut() {
+            *b = self.out.pop_front().ok_or_else(|| {
+                DeviceError::Io(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "sim: read with no queued response",
+                ))
+            })?;
+        }
+        Ok(())
+    }
+    fn set_timeout(&mut self, _t: Duration) -> Result<(), DeviceError> {
+        Ok(())
+    }
+    fn flush_input(&mut self) {
+        self.out.clear();
+    }
+}

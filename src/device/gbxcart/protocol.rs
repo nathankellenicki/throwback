@@ -27,6 +27,8 @@ pub const CMD_DMG_CART_WRITE_SRAM: u8 = 0xB3;
 pub const CMD_DMG_MBC_RESET: u8 = 0xB4;
 pub const CMD_DMG_MBC7_READ_EEPROM: u8 = 0xB5;
 pub const CMD_DMG_MBC7_WRITE_EEPROM: u8 = 0xB6;
+/// MMSA (GB Memory) hidden-map / flash page write: opcode + raw page bytes.
+pub const CMD_DMG_MBC6_MMSA_WRITE_FLASH: u8 = 0xB7;
 
 pub const CMD_AGB_CART_READ: u8 = 0xC1;
 pub const CMD_AGB_CART_WRITE: u8 = 0xC2;
@@ -96,6 +98,9 @@ pub const VAR_ADDRESS: Var = Var(VarWidth::U32, 0x00);
 
 pub const VAR_TRANSFER_SIZE: Var = Var(VarWidth::U16, 0x00);
 pub const VAR_BUFFER_SIZE: Var = Var(VarWidth::U16, 0x01);
+pub const VAR_DMG_ROM_BANK: Var = Var(VarWidth::U16, 0x02);
+pub const VAR_STATUS_REGISTER_MASK: Var = Var(VarWidth::U16, 0x05);
+pub const VAR_STATUS_REGISTER_VALUE: Var = Var(VarWidth::U16, 0x06);
 
 pub const VAR_CART_MODE: Var = Var(VarWidth::U8, 0x00);
 pub const VAR_DMG_ACCESS_MODE: Var = Var(VarWidth::U8, 0x01);

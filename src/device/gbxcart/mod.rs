@@ -15,6 +15,7 @@ pub mod transport;
 
 mod agb;
 mod flash;
+mod gbmemory;
 mod mbc;
 mod rtc;
 
@@ -574,5 +575,27 @@ impl<T: Transport> CartridgeDevice for GbxCart<T> {
         let result = self.write_mbc3_rtc(data);
         self.idle();
         result
+    }
+
+    fn is_gb_memory(&mut self) -> Result<bool, DeviceError> {
+        self.detect_gb_memory()
+    }
+
+    fn read_gb_memory(&mut self, progress: &dyn Fn(u32)) -> Result<(Vec<u8>, Vec<u8>), DeviceError> {
+        self.read_gb_memory(progress)
+    }
+
+    fn read_gb_memory_map(&mut self) -> Result<Vec<u8>, DeviceError> {
+        self.read_gb_memory_map()
+    }
+
+    fn write_gb_memory(
+        &mut self,
+        image: &[u8],
+        map: &[u8],
+        progress: &dyn Fn(u32),
+        erase_progress: &dyn Fn(&str),
+    ) -> Result<(), DeviceError> {
+        self.write_gb_memory(image, map, progress, erase_progress)
     }
 }
