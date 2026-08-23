@@ -112,6 +112,23 @@ pub static FLASH_PROFILES: &[FlashProfile] = &[
         sector_size: 64 * KB,
         chip_erase_ms: 60_000,
     },
+    FlashProfile {
+        // AMD/Spansion 2 MB boot-block part (CFI: 2^21 bytes, four non-uniform
+        // erase regions). A0 is a don't-care in autoselect, so the JEDEC ID
+        // reads doubled: mfr 0x01, device 0xD2 -> [01, 01, D2, D2]. Non-uniform
+        // sectors rule out uniform sector-erase, so this profile chip-erases.
+        // Hardware-verified on an insideGadgets GB 2 MB cart.
+        name: "insideGadgets GB 2 MB (AMD/Spansion boot-block)",
+        family: CartFamily::Dmg,
+        flash_ids: &[&[0x01, 0x01, 0xD2, 0xD2]],
+        cmd_set: CmdSet::Amd,
+        method: Method::Unbuffered,
+        we_pin: WePin::Wr,
+        unlock: (0xAAA, 0x555),
+        max_size: 2 * MB,
+        sector_size: 0, // boot-block layout -> chip erase
+        chip_erase_ms: 120_000, // FlashGBX config: 120 s
+    },
     // --- AGB (x16 bus; IDs as raw little-endian byte streams) ---------------
     FlashProfile {
         name: "S29GL/MSP55LV family (16-32 MB AGB)", // verify on hardware

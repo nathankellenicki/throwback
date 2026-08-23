@@ -336,6 +336,32 @@ impl<T: Transport> GbxCart<T> {
             return Ok(Some(()));
         }
 
+        // The header didn't validate. It may still be a flashcart holding a
+        // headerless or corrupt image (mid-development, or a previous write that
+        // left non-ROM data) — such a cart must stay re-writeable. Probe for a
+        // supported flash chip: if one answers, treat it as a present, flashable
+        // DMG cart (MBC5 wiring, as all our DMG flashcarts use). An empty slot
+        // has no chip and stays "not present".
+        self.state = Some(CartState {
+            family: CartFamily::Dmg,
+            header,
+            mbc: MbcKind::Mbc5,
+            ram_size: 0,
+            flash: None,
+        });
+        let matched = match self.probe_flash_id() {
+            Ok(Some(id)) => flash::match_profile(CartFamily::Dmg, &id),
+            _ => None,
+        };
+        if let Some(profile) = matched {
+            if let Some(state) = self.state.as_mut() {
+                state.flash = Some(Some(profile));
+            }
+            self.idle();
+            return Ok(Some(()));
+        }
+
+        self.state = None;
         self.idle();
         Ok(None)
     }

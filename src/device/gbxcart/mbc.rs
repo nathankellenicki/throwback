@@ -93,9 +93,12 @@ pub fn rom_bank_writes(kind: MbcKind, bank: u32) -> Vec<(u16, u8)> {
         MbcKind::Mbc30 | MbcKind::Camera | MbcKind::Huc1 | MbcKind::Huc3 | MbcKind::Mbc7 => {
             vec![(0x2100, (bank & 0xFF) as u8)]
         }
+        // High bank byte first, low byte last: some MBC5 flashcarts (e.g. the
+        // insideGadgets 2 MB) latch the bank on the 0x2100 write and a trailing
+        // 0x3000 write clears the low bits, so the low write must come last.
         MbcKind::Mbc5 => vec![
-            (0x2100, (bank & 0xFF) as u8),
             (0x3000, ((bank >> 8) & 0x01) as u8),
+            (0x2100, (bank & 0xFF) as u8),
         ],
     }
 }
@@ -344,10 +347,12 @@ mod tests {
 
     #[test]
     fn mbc5_bank_plan_carries_ninth_bit() {
-        assert_eq!(rom_bank_writes(MbcKind::Mbc5, 0x1FF), vec![(0x2100, 0xFF), (0x3000, 0x01)]);
-        assert_eq!(rom_bank_writes(MbcKind::Mbc5, 0x0FF), vec![(0x2100, 0xFF), (0x3000, 0x00)]);
+        // High byte (0x3000) first, low byte (0x2100) last: the low write must
+        // land last or some flashcarts clear it (see rom_bank_writes).
+        assert_eq!(rom_bank_writes(MbcKind::Mbc5, 0x1FF), vec![(0x3000, 0x01), (0x2100, 0xFF)]);
+        assert_eq!(rom_bank_writes(MbcKind::Mbc5, 0x0FF), vec![(0x3000, 0x00), (0x2100, 0xFF)]);
         // Bank 0 is directly mappable on MBC5 (unlike MBC1/3).
-        assert_eq!(rom_bank_writes(MbcKind::Mbc5, 0), vec![(0x2100, 0x00), (0x3000, 0x00)]);
+        assert_eq!(rom_bank_writes(MbcKind::Mbc5, 0), vec![(0x3000, 0x00), (0x2100, 0x00)]);
     }
 
     #[test]
