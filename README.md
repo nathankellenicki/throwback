@@ -98,6 +98,8 @@ A save backed up here works in an emulator, and a save from an emulator works he
 
 For a cart with a clock (the MBC3 games like Pokémon Gold, Silver, and Crystal), `read-save` stores the clock in the save file, and `write-save` sets it back on the cart. This matches how emulators handle these saves. Pass `--no-rtc` to leave the clock out of a backup, or to restore the save without changing the cart's clock.
 
+On a Nintendo Power GB Memory cart, the games share one block of save memory, each game with its own slot. Point `read-save` at a directory and it writes one `.sav` per game. `write-save` puts them back, each into its own slot, and leaves the other games' saves alone. A game with no save is skipped.
+
 ### read-rtc and write-rtc
 
 Read or set the clock on a Game Boy cart that has one (the MBC3 games, such as Pokémon Gold, Silver, and Crystal).

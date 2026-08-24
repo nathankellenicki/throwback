@@ -194,6 +194,22 @@ pub trait CartridgeDevice {
     ) -> Result<(), DeviceError> {
         Err(DeviceError::Unsupported("GB Memory is not supported on this device"))
     }
+
+    /// Read the 128 KiB shared SRAM of a GB Memory cart (every game's save
+    /// region; split per game via the map sector). Unsupported devices error.
+    fn read_gb_memory_sram(&mut self, _progress: &dyn Fn(u32)) -> Result<Vec<u8>, DeviceError> {
+        Err(DeviceError::Unsupported("GB Memory is not supported on this device"))
+    }
+
+    /// Write the 128 KiB shared SRAM of a GB Memory cart. Unsupported devices
+    /// error.
+    fn write_gb_memory_sram(
+        &mut self,
+        _data: &[u8],
+        _progress: &dyn Fn(u32),
+    ) -> Result<(), DeviceError> {
+        Err(DeviceError::Unsupported("GB Memory is not supported on this device"))
+    }
 }
 
 /// CH340 USB-serial bridge IDs used by the GBxCart RW. These are generic

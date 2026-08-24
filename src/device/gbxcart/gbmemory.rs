@@ -61,6 +61,9 @@ const MAP_SIZE: usize = crate::gbmemory::MAP_SIZE;
 const GBM_CHUNK: usize = 0x400;
 /// Host-side status-poll bit (DQ7).
 const STATUS_READY: u8 = 0x80;
+/// Shared SRAM: 16 banks × 8 KiB = 128 KiB, split across games by the map.
+const SRAM_SIZE: usize = 128 * 1024;
+const SRAM_BANK: usize = 0x2000;
 
 impl<T: Transport> GbxCart<T> {
     // --- MMC primitives ------------------------------------------------------
@@ -423,6 +426,73 @@ impl<T: Transport> GbxCart<T> {
             }
         }
         Err(DeviceError::Protocol("could not read the GB Memory map sector".into()))
+    }
+
+    /// Read the full 128 KiB shared SRAM (16 banks × 8 KiB). In map-full mode
+    /// the G-MMC1 emulates an MBC5, so RAM access is the ordinary MBC5 dance
+    /// (enable at 0x0000, bank-select at 0x4000, read the 0xA000 window). The
+    /// RAM registers don't overlap the MMC window (0x120-0x13F), so unlike the
+    /// ROM header this reads cleanly with the MMC asleep.
+    pub(super) fn read_gb_memory_sram(
+        &mut self,
+        progress: &dyn Fn(u32),
+    ) -> Result<Vec<u8>, DeviceError> {
+        self.enter_dmg_mode()?;
+        self.enable_mapper()?;
+        self.dmg_write(0x0000, 0x0A)?; // RAM enable
+        let result = (|| {
+            let mut sram = Vec::with_capacity(SRAM_SIZE);
+            for bank in 0..(SRAM_SIZE / SRAM_BANK) as u32 {
+                self.dmg_write(0x4000, (bank & 0x0F) as u8)?; // RAM bank select
+                self.set_variable(VAR_DMG_ACCESS_MODE, DMG_ACCESS_RAM_READ)?;
+                self.set_variable(VAR_DMG_READ_CS_PULSE, 1)?;
+                let data = self.read_at(CMD_DMG_CART_READ, 0xA000, MAX_BUFFER_READ, SRAM_BANK)?;
+                sram.extend_from_slice(&data);
+                progress(sram.len() as u32);
+            }
+            Ok(sram)
+        })();
+        // Always drop RAM enable, even on error (bus-noise protection).
+        let disable = self.dmg_write(0x0000, 0x00);
+        self.gbm_reset()?;
+        self.idle();
+        result.and_then(|s| disable.map(|()| s))
+    }
+
+    /// Write the full 128 KiB shared SRAM back (MBC5-style, map-full mode).
+    pub(super) fn write_gb_memory_sram(
+        &mut self,
+        data: &[u8],
+        progress: &dyn Fn(u32),
+    ) -> Result<(), DeviceError> {
+        if data.len() != SRAM_SIZE {
+            return Err(DeviceError::Protocol("bad GB Memory SRAM size".into()));
+        }
+        self.enter_dmg_mode()?;
+        self.enable_mapper()?;
+        self.dmg_write(0x0000, 0x0A)?; // RAM enable
+        let result = (|| {
+            let mut written = 0usize;
+            for (bank, bank_data) in data.chunks(SRAM_BANK).enumerate() {
+                self.dmg_write(0x4000, (bank as u32 & 0x0F) as u8)?; // RAM bank select
+                self.set_variable(VAR_DMG_ACCESS_MODE, DMG_ACCESS_RAM_WRITE)?;
+                self.set_variable(VAR_DMG_WRITE_CS_PULSE, 1)?;
+                self.set_variable(VAR_ADDRESS, 0xA000)?;
+                self.set_variable(VAR_TRANSFER_SIZE, 0x200)?;
+                for chunk in bank_data.chunks(0x200) {
+                    self.io.write_all(&[CMD_DMG_CART_WRITE_SRAM])?;
+                    self.io.write_all(chunk)?;
+                    self.expect_ack()?;
+                    written += chunk.len();
+                    progress(written as u32);
+                }
+            }
+            Ok(())
+        })();
+        let disable = self.dmg_write(0x0000, 0x00);
+        self.gbm_reset()?;
+        self.idle();
+        result.and(disable)
     }
 
     /// Write a full 1 MiB image + map sector to the cart (chip-erases first).

@@ -81,6 +81,10 @@ pub struct ExtractedGame {
     pub title: String,
     pub is_cgb: bool,
     pub data: Vec<u8>,
+    /// Byte offset of this game's save in the shared 128 KiB SRAM.
+    pub save_offset: usize,
+    /// This game's save size in bytes (0 if it has no battery save).
+    pub save_size: usize,
 }
 
 /// The 8-byte writer ID throwback stamps into carts it assembles (honest,
@@ -151,6 +155,18 @@ fn map_ram_code(ram_kib: u32) -> u8 {
         32 => 3,
         64 => 4,
         128 => 5,
+        _ => 0,
+    }
+}
+
+/// RAM size in KiB from the map's 3-bit RAM code (inverse of `map_ram_code`).
+fn ram_kib_from_map_code(code: u8) -> u32 {
+    match code {
+        1 => 2,
+        2 => 8,
+        3 => 32,
+        4 => 64,
+        5 => 128,
         _ => 0,
     }
 }
@@ -416,7 +432,18 @@ pub fn extract_games(image: &[u8], map: &[u8; MAP_SIZE]) -> Vec<ExtractedGame> {
         }
         let title = crate::cartridge::parse_gb_title(slice).unwrap_or_default();
         let is_cgb = slice.get(0x143).is_some_and(|&b| b & 0x80 != 0);
-        out.push(ExtractedGame { title, is_cgb, data: slice.to_vec() });
+        // Save slot: RAM code spans byte0 (high 2 bits) and byte1 (low bit);
+        // byte2 is the SRAM offset in 2 KiB units.
+        let ram_code = ((e[0] & 0x03) << 1) | ((e[1] >> 7) & 1);
+        let save_size = ram_kib_from_map_code(ram_code) as usize * 1024;
+        let save_offset = (e[2] as usize & 0x3F) * 0x800; // 2 KiB units
+        out.push(ExtractedGame {
+            title,
+            is_cgb,
+            data: slice.to_vec(),
+            save_offset,
+            save_size,
+        });
     }
     out
 }
@@ -695,6 +722,13 @@ mod tests {
         for (g, orig) in got.iter().zip(&games) {
             assert_eq!(&g.data, orig);
         }
+
+        // Save slots decode back to the writer's SRAM layout: each game reserves
+        // at least an 8 KiB slot, so ALPHA(8K)@0, BETA(no save) still advances
+        // the cursor, GAMMA(32K)@16K.
+        assert_eq!((got[0].save_offset, got[0].save_size), (0, 8 * 1024));
+        assert_eq!(got[1].save_size, 0); // BETA is ROM-only, no battery save
+        assert_eq!((got[2].save_offset, got[2].save_size), (16 * 1024, 32 * 1024));
     }
 
     #[test]

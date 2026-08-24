@@ -852,19 +852,101 @@ fn is_dir_target(output: &Path) -> bool {
 }
 
 /// A safe filename for an extracted game (`01_TITLE.gb`, prefix only when many).
-fn game_filename(game: &gbmemory::ExtractedGame, index: usize, many: bool) -> String {
-    let title: String = game
-        .title
+/// Filesystem-safe game title (alphanumerics kept, everything else `_`).
+fn sanitized_title(title: &str) -> String {
+    let t: String = title
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
         .collect();
-    let title = title.trim_matches('_');
-    let title = if title.is_empty() { "GAME" } else { title };
+    let t = t.trim_matches('_');
+    if t.is_empty() { "GAME".to_string() } else { t.to_string() }
+}
+
+fn game_filename(game: &gbmemory::ExtractedGame, index: usize, many: bool) -> String {
+    let title = sanitized_title(&game.title);
     let ext = if game.is_cgb { "gbc" } else { "gb" };
     if many {
         format!("{:02}_{title}.{ext}", index + 1)
     } else {
         format!("{title}.{ext}")
+    }
+}
+
+/// Save filename for a GB Memory game (`.sav`), numbered to match its ROM file.
+fn save_filename(game: &gbmemory::ExtractedGame, index: usize, many: bool) -> String {
+    let title = sanitized_title(&game.title);
+    if many {
+        format!("{:02}_{title}.sav", index + 1)
+    } else {
+        format!("{title}.sav")
+    }
+}
+
+/// `read-save` for a GB Memory cart: back up each game's save, split out of the
+/// shared 128 KiB SRAM by the map. A directory gets one `.sav` per game; a file
+/// works only when a single game has a save.
+fn read_gb_memory_saves(device: &mut dyn CartridgeDevice, output: &Path) {
+    eprintln!("Reading GB Memory cartridge to map saves...");
+    let (image, map) = device
+        .read_gb_memory(&|cur| print_progress("Reading ROM", cur, gbmemory::IMAGE_SIZE as u32))
+        .unwrap_or_else(|e| {
+            eprintln!("\nError: {e}");
+            process::exit(1);
+        });
+    let map_arr: [u8; gbmemory::MAP_SIZE] = map.try_into().unwrap_or([0u8; gbmemory::MAP_SIZE]);
+    let games = gbmemory::extract_games(&image, &map_arr);
+    let many = games.len() > 1;
+
+    let with_saves: Vec<(usize, &gbmemory::ExtractedGame)> =
+        games.iter().enumerate().filter(|(_, g)| g.save_size > 0).collect();
+    if with_saves.is_empty() {
+        eprintln!("None of the games on this cartridge have battery saves.");
+        process::exit(1);
+    }
+
+    eprintln!("Reading saves (128 KB SRAM)...");
+    let sram = device
+        .read_gb_memory_sram(&|cur| print_progress("Reading SRAM", cur, 128 * 1024))
+        .unwrap_or_else(|e| {
+            eprintln!("\nError: {e}");
+            process::exit(1);
+        });
+
+    let slice = |g: &gbmemory::ExtractedGame| -> Vec<u8> {
+        let end = (g.save_offset + g.save_size).min(sram.len());
+        sram.get(g.save_offset..end).unwrap_or(&[]).to_vec()
+    };
+
+    let dir_mode = is_dir_target(output);
+    if with_saves.len() > 1 && !dir_mode {
+        eprintln!(
+            "This cartridge has {} games with saves. Give a directory instead, e.g. read-save ./saves/",
+            with_saves.len()
+        );
+        process::exit(1);
+    }
+
+    if dir_mode {
+        fs::create_dir_all(output).unwrap_or_else(|e| {
+            eprintln!("Error creating output directory: {e}");
+            process::exit(1);
+        });
+        for (i, g) in &with_saves {
+            let path = output.join(save_filename(g, *i, many));
+            fs::write(&path, slice(g)).unwrap_or_else(|e| {
+                eprintln!("Error writing {}: {e}", path.display());
+                process::exit(1);
+            });
+            eprintln!("Wrote {} ({}).", path.display(), format_size(g.save_size as u32));
+        }
+        eprintln!("Backed up {} save(s) to {}.", with_saves.len(), output.display());
+    } else {
+        let (_, g) = with_saves[0];
+        fs::write(output, slice(g)).unwrap_or_else(|e| {
+            eprintln!("Error writing file: {e}");
+            process::exit(1);
+        });
+        eprintln!("Wrote {} ({}).", output.display(), format_size(g.save_size as u32));
     }
 }
 
@@ -933,6 +1015,111 @@ fn dump_gb_memory(device: &mut dyn CartridgeDevice, output: &Path, full: bool) {
         });
         eprintln!("Wrote {}.", output.display());
     }
+}
+
+/// `write-save` for a GB Memory cart: splice each game's `.sav` back into the
+/// shared 128 KiB SRAM (read-modify-write, so untouched games keep their saves).
+/// A directory is matched against the games by filename; a single file works
+/// only when one game has a save.
+fn write_gb_memory_saves(device: &mut dyn CartridgeDevice, input: &Path, yes: bool) {
+    eprintln!("Reading GB Memory cartridge to map saves...");
+    let (image, map) = device
+        .read_gb_memory(&|cur| print_progress("Reading ROM", cur, gbmemory::IMAGE_SIZE as u32))
+        .unwrap_or_else(|e| {
+            eprintln!("\nError: {e}");
+            process::exit(1);
+        });
+    let map_arr: [u8; gbmemory::MAP_SIZE] = map.try_into().unwrap_or([0u8; gbmemory::MAP_SIZE]);
+    let games = gbmemory::extract_games(&image, &map_arr);
+    let many = games.len() > 1;
+    let with_saves: Vec<(usize, &gbmemory::ExtractedGame)> =
+        games.iter().enumerate().filter(|(_, g)| g.save_size > 0).collect();
+    if with_saves.is_empty() {
+        eprintln!("None of the games on this cartridge have battery saves.");
+        process::exit(1);
+    }
+
+    // Gather the (game, new save bytes) to apply.
+    let mut updates: Vec<(&gbmemory::ExtractedGame, Vec<u8>)> = Vec::new();
+    if input.is_dir() {
+        for (i, g) in &with_saves {
+            let path = input.join(save_filename(g, *i, many));
+            match fs::read(&path) {
+                Ok(bytes) if bytes.len() == g.save_size => updates.push((g, bytes)),
+                Ok(bytes) => {
+                    eprintln!(
+                        "Error: {} is {} but {}'s save slot is {}.",
+                        path.display(),
+                        format_size(bytes.len() as u32),
+                        g.title.trim(),
+                        format_size(g.save_size as u32)
+                    );
+                    process::exit(1);
+                }
+                Err(_) => {} // no file for this game — leave its save untouched
+            }
+        }
+        if updates.is_empty() {
+            eprintln!("No matching .sav files found in {}.", input.display());
+            process::exit(1);
+        }
+    } else {
+        if with_saves.len() > 1 {
+            eprintln!(
+                "This cartridge has {} games with saves. Give a directory of .sav files instead.",
+                with_saves.len()
+            );
+            process::exit(1);
+        }
+        let (_, g) = with_saves[0];
+        let bytes = fs::read(input).unwrap_or_else(|e| {
+            eprintln!("Error reading file: {e}");
+            process::exit(1);
+        });
+        if bytes.len() != g.save_size {
+            eprintln!(
+                "Error: save file is {} but {}'s save slot is {}.",
+                format_size(bytes.len() as u32),
+                g.title.trim(),
+                format_size(g.save_size as u32)
+            );
+            process::exit(1);
+        }
+        updates.push((g, bytes));
+    }
+
+    if !yes
+        && !confirm(&format!(
+            "Overwrite {} save(s) on the GB Memory cartridge? This cannot be undone.",
+            updates.len()
+        ))
+    {
+        eprintln!("Aborted.");
+        process::exit(1);
+    }
+
+    // Read-modify-write: only the updated games' slots change.
+    eprintln!("Reading current saves (128 KB SRAM)...");
+    let mut sram = device
+        .read_gb_memory_sram(&|cur| print_progress("Reading SRAM", cur, 128 * 1024))
+        .unwrap_or_else(|e| {
+            eprintln!("\nError: {e}");
+            process::exit(1);
+        });
+    for (g, bytes) in &updates {
+        let end = g.save_offset + g.save_size;
+        if end <= sram.len() {
+            sram[g.save_offset..end].copy_from_slice(bytes);
+        }
+    }
+
+    device
+        .write_gb_memory_sram(&sram, &|cur| print_progress("Writing SRAM", cur, 128 * 1024))
+        .unwrap_or_else(|e| {
+            eprintln!("\nError: {e}");
+            process::exit(1);
+        });
+    eprintln!("Wrote {} save(s) to the GB Memory cartridge.", updates.len());
 }
 
 /// `write-rom` on a GB Memory cart: single game, full mode (direct boot).
@@ -1241,6 +1428,13 @@ fn main() {
 
             match info.cart_type {
                 CartridgeType::GB => {
+                    // GB Memory: saves live in the shared 128 KiB SRAM, one slot
+                    // per game, so extract them via the map instead.
+                    if device.is_gb_memory().unwrap_or(false) {
+                        read_gb_memory_saves(device.as_mut(), &output);
+                        return;
+                    }
+
                     if info.ram_size == 0 {
                         eprintln!("This cartridge has no save RAM.");
                         process::exit(1);
@@ -1385,6 +1579,13 @@ fn main() {
         Commands::WriteSave { input, no_rtc, yes } => {
             let mut device = open_device();
             let info = read_cart_info(device.as_mut());
+
+            // GB Memory: restore per-game saves into the shared SRAM (input may
+            // be a directory), so handle it before reading a single file.
+            if info.cart_type == CartridgeType::GB && device.is_gb_memory().unwrap_or(false) {
+                write_gb_memory_saves(device.as_mut(), &input, yes);
+                return;
+            }
 
             let data = fs::read(&input).unwrap_or_else(|e| {
                 eprintln!("Error reading file: {e}");

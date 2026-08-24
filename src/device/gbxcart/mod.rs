@@ -624,4 +624,16 @@ impl<T: Transport> CartridgeDevice for GbxCart<T> {
     ) -> Result<(), DeviceError> {
         self.write_gb_memory(image, map, progress, erase_progress)
     }
+
+    fn read_gb_memory_sram(&mut self, progress: &dyn Fn(u32)) -> Result<Vec<u8>, DeviceError> {
+        self.read_gb_memory_sram(progress)
+    }
+
+    fn write_gb_memory_sram(
+        &mut self,
+        data: &[u8],
+        progress: &dyn Fn(u32),
+    ) -> Result<(), DeviceError> {
+        self.write_gb_memory_sram(data, progress)
+    }
 }
